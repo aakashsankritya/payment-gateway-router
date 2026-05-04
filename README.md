@@ -124,6 +124,438 @@ curl http://localhost:8080/gateways
 curl http://localhost:8080/health
 ```
 
+## Request Flow Diagrams
+
+The HTTP surface is registered in `internal/adapters/http/router.go` and currently exposes four routes:
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Process liveness check. |
+| `GET` | `/gateways` | Current gateway config, runtime health state, and rolling callback stats. |
+| `POST` | `/transactions/initiate` | Create a pending transaction and initiate it on a selected gateway. |
+| `POST` | `/transactions/callback` | Finalize a transaction exactly once and update gateway health from the outcome. |
+
+Runtime storage is selected during boot in `cmd/payment-gateway-router/main.go`: `STATE_BACKEND=memory` is the default, and `STATE_BACKEND=redis` swaps both transaction and gateway health repositories to Redis after a successful `PING`.
+
+```mermaid
+sequenceDiagram
+    participant Main as main()
+    participant Runtime as RuntimeConfig
+    participant Config as FileProvider
+    participant TxRepo as TransactionRepository
+    participant HealthRepo as GatewayHealthRepository
+    participant Redis as Redis Store
+    participant Health as HealthService
+    participant Routing as RoutingService
+    participant TxnSvc as TransactionService
+    participant Router as HTTP Router
+
+    Main->>Runtime: LoadRuntimeConfig()
+    Runtime-->>Main: addr, config path, cache TTLs, backend
+    Main->>Config: NewFileProvider(config_path)
+    Config->>Config: parse YAML/JSON, apply defaults, validate
+    Main->>Config: Watch(ctx, reload interval)
+
+    alt STATE_BACKEND=redis
+        Main->>Redis: NewStore(redis options)
+        Main->>Redis: Ping(ctx)
+        Redis-->>Main: ok
+        Main->>TxRepo: redis.NewTransactionRepository(store)
+        Main->>HealthRepo: redis.NewGatewayHealthRepository(store)
+    else default memory backend
+        Main->>TxRepo: memory.NewTransactionRepository()
+        Main->>HealthRepo: memory.NewGatewayHealthRepository()
+    end
+
+    Main->>Health: NewHealthService(HealthRepo, Config)
+    Main->>Routing: NewRoutingService(Config, Health)
+    Main->>TxnSvc: NewTransactionService(TxRepo, Routing, Health, mock.Registry)
+    Main->>Router: NewRouter(TxnSvc, Health, Config)
+    Router-->>Main: http.Handler
+```
+
+### `GET /health`
+
+`/health` is intentionally shallow. It confirms that the process can serve HTTP, but it does not check Redis, gateway config validity after startup, configured downstream gateways, or repository health.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router as HTTP Router
+
+    Client->>Router: GET /health
+    Router->>Router: handleHealth()
+    Router-->>Client: 200 {"status":"ok"}
+```
+
+Important behavior:
+
+- Always returns `200 OK` while the process is serving requests.
+- Does not call the service layer or any repository.
+- Should be treated as liveness, not a deep readiness or dependency-health endpoint.
+
+### `GET /gateways`
+
+`/gateways` returns the hot-reloaded routing config plus runtime state and rolling stats for every configured gateway. It includes disabled gateways too, because it iterates over the complete config snapshot.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router as HTTP Router
+    participant Config as FileProvider
+    participant Health as HealthService
+    participant Repo as GatewayHealthRepository
+
+    Client->>Router: GET /gateways
+    Router->>Config: Current(ctx).WithDefaults()
+    Config-->>Router: AppConfig{Routing, Gateways}
+
+    loop each configured gateway
+        Router->>Health: State(ctx, gateway)
+        Health->>Repo: Ensure(gateway, now)
+        Note over Repo: Missing state is created as healthy.
+        Health->>Repo: Get(gateway)
+        Repo-->>Health: GatewayRuntimeState
+        Health-->>Router: runtime state
+
+        Router->>Health: Stats(ctx, gateway)
+        Health->>Config: Current(ctx).WithDefaults()
+        Health->>Repo: StatsSince(gateway, windowStart, now, 1 minute)
+        Note over Repo: Memory scans retained events.<br/>Redis reads minute buckets.
+        Repo-->>Health: successes, failures, total, success_rate
+        Health-->>Router: GatewayStats
+    end
+
+    alt state or stats read fails
+        Router-->>Client: 500 gateway_state_error or gateway_stats_error
+    else all gateway reads succeed
+        Router-->>Client: 200 {routing, gateways[]}
+    end
+```
+
+Important behavior:
+
+- Config is read through the `FileProvider`, so edits to `configs/gateways.yaml` are reflected after the reload interval if the file remains valid.
+- `HealthService.State()` calls `Ensure()` before `Get()`, so first inspection initializes a missing runtime state as `healthy`.
+- `HealthService.Stats()` uses the configured `health_window_seconds`.
+- Memory stats are process-local event scans.
+- Redis stats are stored as per-minute success/failure hash buckets with TTL.
+- Any state or stats error stops the loop and returns `500`.
+
+### `POST /transactions/initiate`
+
+Initiation validates input, selects a gateway through the routing service, creates the next attempt for the order, calls the mock gateway client, and stores the transaction as `pending`.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router as HTTP Router
+    participant TxnSvc as TransactionService
+    participant Routing as RoutingService
+    participant Config as FileProvider
+    participant Health as HealthService
+    participant HealthRepo as GatewayHealthRepository
+    participant TxnRepo as TransactionRepository
+    participant Gateway as MockGatewayClient
+
+    Client->>Router: POST /transactions/initiate
+    Router->>Router: decode JSON with DisallowUnknownFields()
+    Router->>Router: trim and validate order_id
+    Router->>Router: validate positive amount
+    Router->>Router: default nil payment_instrument to {}
+
+    alt invalid JSON or validation failure
+        Router-->>Client: 400 invalid_json / invalid_order_id / invalid_amount
+    else request is valid
+        Router->>TxnSvc: Initiate(order_id, amount, payment_instrument)
+        TxnSvc->>Routing: SelectGateway(ctx)
+
+        Routing->>Routing: read short-lived routing snapshot cache
+        alt cache expired or empty
+            Routing->>Config: Current(ctx).WithDefaults()
+            Config-->>Routing: routing config and gateway list
+            loop each gateway
+                alt disabled or non-positive weight
+                    Routing->>Routing: skip gateway
+                else enabled weighted gateway
+                    Routing->>Health: PrepareForRouting(gateway, routing)
+                    Health->>HealthRepo: Ensure/Get state, using short state cache
+                    alt unhealthy cooldown expired
+                        Health->>HealthRepo: Save(state=half_open, in_flight=0)
+                    end
+                    Health-->>Routing: healthy / unhealthy / half_open
+                    Routing->>Routing: add healthy or eligible half_open probe candidate
+                end
+            end
+            Routing->>Routing: cache healthy and probe candidates
+        end
+
+        alt half_open probe candidates exist
+            Routing->>Routing: atomic weighted select from probes
+            Routing->>Health: MarkProbeSelected(gateway)
+            Health->>HealthRepo: TryAcquireHalfOpenProbe(gateway, max)
+            alt probe acquired
+                HealthRepo-->>Health: state with in_flight incremented
+                Health-->>Routing: ok
+                Routing-->>TxnSvc: selected probe gateway
+            else probe full or race lost
+                Health-->>Routing: ErrNoAvailableGateway
+                Routing->>Routing: invalidate routing cache
+                alt healthy candidates available
+                    Routing->>Routing: fallback to healthy selection
+                    Routing-->>TxnSvc: selected healthy gateway
+                else no healthy fallback
+                    Routing-->>TxnSvc: ErrNoAvailableGateway
+                end
+            end
+        else healthy candidates exist
+            Routing->>Routing: atomic weighted select from healthy candidates
+            Routing-->>TxnSvc: selected healthy gateway
+        else no available gateway
+            Routing-->>TxnSvc: ErrNoAvailableGateway
+        end
+
+        alt gateway selected
+            TxnSvc->>TxnRepo: NextAttempt(order_id)
+            Note over TxnRepo: Memory increments a locked map.<br/>Redis uses INCR.
+            TxnRepo-->>TxnSvc: attempt_no
+            TxnSvc->>TxnSvc: generate txn id and pending transaction
+            TxnSvc->>Gateway: Initiate(transaction)
+            Gateway-->>TxnSvc: gateway_reference_id
+            TxnSvc->>TxnRepo: Save(transaction)
+            Note over TxnRepo: Memory rejects duplicate IDs.<br/>Redis uses SETNX.
+            TxnRepo-->>TxnSvc: saved
+            TxnSvc-->>Router: Transaction
+            Router-->>Client: 201 Transaction
+        else no gateway selected
+            TxnSvc-->>Router: ErrNoAvailableGateway
+            Router-->>Client: 503 no_available_gateway
+        end
+    end
+```
+
+Important behavior:
+
+- Unknown JSON fields are rejected.
+- `order_id` is required after trimming whitespace.
+- `amount` must be greater than zero.
+- `payment_instrument` may be omitted; the service stores an empty object in that case.
+- Routing ignores disabled gateways and gateways with `weight <= 0`.
+- Weighted selection is deterministic under concurrency through an atomic counter, not random selection and not a mutex on the hot path.
+- Half-open gateways are preferred for probes before normal healthy traffic.
+- `NextAttempt(order_id)` allows multiple payment attempts for the same order.
+- A missing registered gateway client is an internal error; the current mock registry returns a client for any gateway name.
+- If all gateways are unavailable, the HTTP response is `503`.
+
+### `POST /transactions/callback`
+
+Callbacks finalize transactions exactly once. Gateway health is updated only when the transaction changes from `pending` to a final status, which prevents duplicate callbacks from double-counting gateway stats.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router as HTTP Router
+    participant TxnSvc as TransactionService
+    participant TxnRepo as TransactionRepository
+    participant Health as HealthService
+    participant Config as FileProvider
+    participant HealthRepo as GatewayHealthRepository
+
+    Client->>Router: POST /transactions/callback
+    Router->>Router: decode JSON with DisallowUnknownFields()
+    Router->>Router: ParseTransactionStatus(status)
+    alt status is not success or failure
+        Router-->>Client: 400 invalid_status
+    else status is final
+        Router->>Router: trim transaction_id, order_id, gateway
+        alt missing transaction_id or gateway
+            Router-->>Client: 400 invalid_transaction_id / invalid_gateway
+        else request is valid
+            Router->>TxnSvc: Callback(transaction_id, order_id, gateway, status, reason)
+            TxnSvc->>TxnRepo: GetByID(transaction_id)
+            alt transaction not found
+                TxnRepo-->>TxnSvc: ErrNotFound
+                TxnSvc-->>Router: ErrNotFound
+                Router-->>Client: 404 not_found
+            else transaction found
+                TxnRepo-->>TxnSvc: Transaction
+
+                alt callback gateway != stored transaction gateway
+                    TxnSvc-->>Router: ErrGatewayMismatch
+                    Router-->>Client: 409 gateway_mismatch
+                else order_id provided and mismatched
+                    TxnSvc-->>Router: ErrConflict
+                    Router-->>Client: 409 conflict
+                else identity checks pass
+                    TxnSvc->>TxnRepo: Complete(transaction_id, final status, reason, now)
+                    Note over TxnRepo: Memory completes under lock.<br/>Redis completes with Lua.
+
+                    alt transaction already final with same status
+                        TxnRepo-->>TxnSvc: transaction, changed=false
+                        TxnSvc->>Health: State(gateway)
+                        Health->>HealthRepo: Ensure/Get
+                        Health-->>TxnSvc: current runtime state
+                        TxnSvc->>Health: Stats(gateway)
+                        Health->>Config: Current(ctx).WithDefaults()
+                        Health->>HealthRepo: StatsSince(windowStart, now, 1 minute)
+                        Health-->>TxnSvc: current stats
+                        TxnSvc-->>Router: CallbackResult{idempotent=true}
+                        Router-->>Client: 200 CallbackResult
+                    else transaction already final with different status
+                        TxnRepo-->>TxnSvc: ErrConflict
+                        TxnSvc-->>Router: ErrConflict
+                        Router-->>Client: 409 conflict
+                    else pending transaction completed
+                        TxnRepo-->>TxnSvc: transaction, changed=true
+                        TxnSvc->>Health: RecordOutcome(gateway, transaction_id, status)
+                        Health->>Config: Current(ctx).WithDefaults()
+                        Health->>HealthRepo: Ensure(gateway, now)
+                        Health->>HealthRepo: RecordEvent(success/failure, retention)
+                        Health->>HealthRepo: Get(gateway)
+                        Health->>HealthRepo: StatsSince(windowStart, now, 1 minute)
+                        Health->>Health: evaluate state transition
+                        Health->>HealthRepo: Save(updated state)
+                        Health-->>TxnSvc: GatewayRuntimeState, GatewayStats
+                        TxnSvc-->>Router: CallbackResult{idempotent=false}
+                        Router-->>Client: 200 CallbackResult
+                    end
+                end
+            end
+        end
+    end
+```
+
+Important behavior:
+
+- Only `success` and `failure` callbacks are accepted. `pending` parses as a known transaction status but is rejected by the handler because it is not final.
+- `transaction_id` and `gateway` are required.
+- `order_id` is optional, but if provided it must match the stored transaction.
+- Callback gateway must match the gateway selected during initiation.
+- Duplicate same-status callbacks return `200` with `idempotent=true` and refreshed gateway state/stats.
+- Duplicate callbacks do not write another gateway outcome event.
+- A different final status after completion returns `409 conflict`.
+- Redis completion is atomic through a Lua script, so multiple service replicas cannot complete and count the same transaction twice.
+
+### Gateway Health State Machine
+
+Gateway health is callback-driven. A gateway only becomes unhealthy after enough final callback outcomes have been recorded in the rolling health window.
+
+```mermaid
+stateDiagram-v2
+    [*] --> healthy: Ensure missing state
+    healthy --> healthy: below min_callback_count
+    healthy --> healthy: success_rate meets threshold
+    healthy --> unhealthy: min callbacks reached and success_rate below threshold
+    unhealthy --> unhealthy: cooldown not expired
+    unhealthy --> half_open: cooldown expired during routing or outcome recording
+    half_open --> healthy: selected probe callback succeeds
+    half_open --> unhealthy: selected probe callback fails
+```
+
+```mermaid
+sequenceDiagram
+    participant Callback as Callback Processing
+    participant Health as HealthService
+    participant Config as FileProvider
+    participant Repo as GatewayHealthRepository
+
+    Callback->>Health: RecordOutcome(gateway, transaction_id, final status)
+    Health->>Config: Current(ctx).WithDefaults()
+    Config-->>Health: health window, threshold, cooldown, probe count
+    Health->>Repo: Ensure(gateway, now)
+    Health->>Repo: RecordEvent(status, retention=health_window*2)
+    Health->>Repo: Get(gateway)
+    Health->>Repo: StatsSince(now-health_window, now, 1 minute)
+    Repo-->>Health: rolling successes/failures/total/success_rate
+
+    alt current state is half_open
+        Health->>Health: decrement half_open_in_flight if needed
+        alt callback success
+            Health->>Health: mark healthy
+        else callback failure
+            Health->>Health: mark unhealthy until now+cooldown
+        end
+    else current state is unhealthy and cooldown expired
+        Health->>Health: mark half_open
+    else healthy/default state
+        alt min callbacks reached and success_rate below threshold
+            Health->>Health: mark unhealthy until now+cooldown
+        else not enough failures
+            Health->>Health: keep or mark healthy
+        end
+    end
+
+    Health->>Repo: Save(updated state)
+    Health-->>Callback: updated state and stats
+```
+
+Key health details:
+
+- Default routing values are `health_window_seconds=900`, `unhealthy_cooldown_seconds=1800`, `min_callback_count=10`, `success_rate_threshold=0.90`, and `half_open_probe_count=1`.
+- `success_rate_threshold` may be configured as a fraction, or as a value above `1` that is normalized as a percentage during defaults.
+- Unhealthy gateways are excluded from routing until `unhealthy_until`.
+- Once cooldown expires, `PrepareForRouting()` can move the gateway to `half_open`.
+- Half-open probe selection is repository-guarded, so the configured in-flight probe count is enforced even under concurrent requests.
+- A half-open success moves the gateway back to `healthy`; a half-open failure moves it back to `unhealthy`.
+
+### Repository Guarantees
+
+```mermaid
+sequenceDiagram
+    participant Service
+    participant Repo as Repository Interface
+    participant Memory as Memory Backend
+    participant Redis as Redis Backend
+
+    Service->>Repo: NextAttempt(order_id)
+    alt memory backend
+        Repo->>Memory: lock and increment attempts[order_id]
+    else redis backend
+        Repo->>Redis: INCR pgr:order:{order_id}:attempt
+    end
+
+    Service->>Repo: Save(transaction)
+    alt memory backend
+        Repo->>Memory: lock and reject duplicate transaction ID
+    else redis backend
+        Repo->>Redis: SETNX pgr:transaction:{id}
+    end
+
+    Service->>Repo: Complete(transaction_id, final status)
+    alt memory backend
+        Repo->>Memory: lock, check final status, update once
+    else redis backend
+        Repo->>Redis: Lua script checks and updates atomically
+    end
+
+    Service->>Repo: TryAcquireHalfOpenProbe(gateway)
+    alt memory backend
+        Repo->>Memory: lock and increment half_open_in_flight
+    else redis backend
+        Repo->>Redis: Lua script checks and increments atomically
+    end
+```
+
+Backend notes:
+
+- The memory backend is safe within one process, but transaction state, attempts, gateway health, and stats are not shared across replicas.
+- The Redis backend is the horizontally scalable path for shared transaction state, rolling callback counters, gateway runtime state, and half-open probe coordination.
+- Redis transaction saves use `SETNX`, order attempts use `INCR`, completion uses Lua, and half-open probe acquisition uses Lua.
+- Redis callback stats are aggregated into minute buckets and expire after the configured retention window.
+
+### Error Mapping
+
+Service errors are mapped to HTTP responses in `writeServiceError()`:
+
+| Error | HTTP status | Error code |
+| --- | --- | --- |
+| `ErrNoAvailableGateway` | `503` | `no_available_gateway` |
+| `ErrNotFound` | `404` | `not_found` |
+| `ErrConflict` | `409` | `conflict` |
+| `ErrGatewayMismatch` | `409` | `gateway_mismatch` |
+| `ErrInvalidStatus` | `400` | `invalid_status` |
+| Unknown error | `500` | `internal_error` |
+
 ## Traffic Simulator
 
 Run the service first:
@@ -226,4 +658,3 @@ The production path should keep router pods mostly stateless:
 
 At very high scale, Redis should be deployed as a managed cluster or sharded deployment, and callback outcome aggregation can be moved behind Kafka/Pulsar/Kinesis. This code keeps that option open by isolating state behind repository interfaces.
 
-See [docs/scale-architecture.md](docs/scale-architecture.md) for the horizontal scaling model.
