@@ -1,0 +1,65 @@
+services:
+  gateway:
+    build:
+      context: .
+    image: payment-gateway-router:local
+    environment:
+      ADDR: ":8080"
+      CONFIG_PATH: /app/configs/gateways.yaml
+      CONFIG_RELOAD_INTERVAL_SECONDS: "2"
+      STATE_BACKEND: redis
+      REDIS_ADDR: redis:6379
+      REDIS_KEY_PREFIX: pgr
+      REDIS_POOL_SIZE: "256"
+      GATEWAY_STATE_CACHE_TTL_MS: "500"
+      ROUTING_CACHE_TTL_MS: "100"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./configs:/app/configs:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "10000"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  simulator:
+    image: golang:1.26-alpine
+    profiles:
+      - tools
+    working_dir: /src
+    volumes:
+      - .:/src
+    command:
+      - go
+      - run
+      - ./cmd/simulator
+      - -base-url
+      - http://gateway:8080
+      - -total
+      - "10000"
+      - -concurrency
+      - "200"
+      - -success-rate
+      - "0.95"
+      - -duplicate-rate
+      - "0.02"
+    depends_on:
+      gateway:
+        condition: service_started
+
+volumes:
+  redis-data:

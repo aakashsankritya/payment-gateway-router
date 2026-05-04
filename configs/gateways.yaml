@@ -1,0 +1,17 @@
+routing:
+  health_window_seconds: 900
+  unhealthy_cooldown_seconds: 1800
+  min_callback_count: 10
+  success_rate_threshold: 0.90
+  half_open_probe_count: 1
+
+gateways:
+  - name: razorpay
+    enabled: true
+    weight: 50
+  - name: payu
+    enabled: true
+    weight: 30
+  - name: cashfree
+    enabled: true
+    weight: 20
