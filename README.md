@@ -656,5 +656,6 @@ The production path should keep router pods mostly stateless:
 - Half-open probes use an atomic Redis script so 100 replicas do not each send their own probe.
 - Routing selection uses an atomic local counter instead of a mutex, avoiding a hot lock at high concurrency.
 
-At very high scale, Redis should be deployed as a managed cluster or sharded deployment, and callback outcome aggregation can be moved behind Kafka/Pulsar/Kinesis. This code keeps that option open by isolating state behind repository interfaces.
+At very high scale, Redis should be deployed as a managed cluster or sharded deployment, 
+and callback outcome aggregation can be moved behind Kafka/Pulsar/Kinesis. This code keeps that option open by isolating state behind repository interfaces.
 
