@@ -659,3 +659,33 @@ The production path should keep router pods mostly stateless:
 At very high scale, Redis should be deployed as a managed cluster or sharded deployment, 
 and callback outcome aggregation can be moved behind Kafka/Pulsar/Kinesis. This code keeps that option open by isolating state behind repository interfaces.
 
+## Results based on traffic simulation of 10K Requests
+
+```
+=== Simulator Summary ===
+Base URL:             http://gateway:8080
+Requested total:      10000
+Concurrency:          200
+Duration:             3.013s
+Throughput:           3319.29 txn/sec
+Initiated:            10000
+Callbacks sent:       10000
+Success callbacks:    9516
+Failure callbacks:    484
+Duplicate callbacks:  198
+Initiate errors:      0
+Callback errors:      0
+Avg initiate latency: 17.079ms
+Avg callback latency: 42.341ms
+
+=== Client Gateway Distribution ===
+cashfree     initiated=2000 callbacks=2000 success=1898 failure=102 duplicates=41
+payu         initiated=3000 callbacks=3000 success=2854 failure=146 duplicates=59
+razorpay     initiated=5000 callbacks=5000 success=4764 failure=236 duplicates=98
+
+=== Server Gateway Stats ===
+Health window: 900s, threshold: 0.90, min callbacks: 10, cooldown: 1800s, probes: 1
+razorpay     enabled=true weight=50 state=healthy in_flight=0 total=5000 success=4764 failure=236 success_rate=0.9528
+payu         enabled=true weight=30 state=healthy in_flight=0 total=3000 success=2854 failure=146 success_rate=0.9513
+cashfree     enabled=true weight=20 state=healthy in_flight=0 total=2000 success=1898 failure=102 success_rate=0.9490
+```
