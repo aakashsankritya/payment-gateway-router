@@ -12,7 +12,7 @@ Config-driven Go service for dynamic payment gateway routing.
 - Config-driven gateway onboarding and weight changes
 - Runtime config reload from mounted file, no Docker rebuild needed
 - Gateway health state machine: `healthy -> unhealthy -> half_open -> healthy`
-- Configurable success threshold, health window, cooldown, callback minimum, probe count, and probe timeout
+- Configurable success threshold, health window, cooldown, callback minimum, and probe count
 - Idempotent duplicate callbacks
 - Mock payment gateway clients
 - Standard-library HTTP stack and tests
@@ -268,8 +268,7 @@ sequenceDiagram
         Router-->>Client: 400 invalid_json / invalid_order_id / invalid_amount
     else request is valid
         Router->>TxnSvc: Initiate(order_id, amount, payment_instrument)
-        TxnSvc->>TxnSvc: generate transaction_id
-        TxnSvc->>Routing: SelectGateway(ctx, transaction_id)
+        TxnSvc->>Routing: SelectGateway(ctx)
 
         Routing->>Routing: read short-lived routing snapshot cache
         alt cache expired or empty
@@ -293,10 +292,10 @@ sequenceDiagram
 
         alt half_open probe candidates exist
             Routing->>Routing: atomic weighted select from probes
-            Routing->>Health: MarkProbeSelected(gateway, transaction_id)
-            Health->>HealthRepo: TryAcquireHalfOpenProbe(gateway, transaction_id, max, expires_at)
+            Routing->>Health: MarkProbeSelected(gateway)
+            Health->>HealthRepo: TryAcquireHalfOpenProbe(gateway, max)
             alt probe acquired
-                HealthRepo-->>Health: state with probe lease and in_flight incremented
+                HealthRepo-->>Health: state with in_flight incremented
                 Health-->>Routing: ok
                 Routing-->>TxnSvc: selected probe gateway
             else probe full or race lost
@@ -328,10 +327,6 @@ sequenceDiagram
             TxnRepo-->>TxnSvc: saved
             TxnSvc-->>Router: Transaction
             Router-->>Client: 201 Transaction
-        else selected probe fails before save
-            TxnSvc->>Health: ReleaseProbe(gateway, transaction_id)
-            Health->>HealthRepo: ReleaseHalfOpenProbe(gateway, transaction_id)
-            TxnSvc-->>Router: error
         else no gateway selected
             TxnSvc-->>Router: ErrNoAvailableGateway
             Router-->>Client: 503 no_available_gateway
@@ -418,7 +413,6 @@ sequenceDiagram
                         Health->>HealthRepo: RecordEvent(success/failure, retention)
                         Health->>HealthRepo: Get(gateway)
                         Health->>HealthRepo: StatsSince(windowStart, now, 1 minute)
-                        Health->>HealthRepo: ReleaseHalfOpenProbe(gateway, transaction_id)
                         Health->>Health: evaluate state transition
                         Health->>HealthRepo: Save(updated state)
                         Health-->>TxnSvc: GatewayRuntimeState, GatewayStats
@@ -497,12 +491,11 @@ sequenceDiagram
 
 Key health details:
 
-- Default routing values are `health_window_seconds=900`, `unhealthy_cooldown_seconds=1800`, `min_callback_count=10`, `success_rate_threshold=0.90`, `half_open_probe_count=1`, and `half_open_probe_timeout_seconds=60`.
+- Default routing values are `health_window_seconds=900`, `unhealthy_cooldown_seconds=1800`, `min_callback_count=10`, `success_rate_threshold=0.90`, and `half_open_probe_count=1`.
 - `success_rate_threshold` may be configured as a fraction, or as a value above `1` that is normalized as a percentage during defaults.
 - Unhealthy gateways are excluded from routing until `unhealthy_until`.
 - Once cooldown expires, `PrepareForRouting()` can move the gateway to `half_open`.
 - Half-open probe selection is repository-guarded, so the configured in-flight probe count is enforced even under concurrent requests.
-- Half-open probe leases are tied to the selected transaction ID and expire after `half_open_probe_timeout_seconds` if no final callback arrives.
 - A half-open success moves the gateway back to `healthy`; a half-open failure moves it back to `unhealthy`.
 
 ### Repository Guarantees
@@ -547,7 +540,7 @@ Backend notes:
 
 - The memory backend is safe within one process, but transaction state, attempts, gateway health, and stats are not shared across replicas.
 - The Redis backend is the horizontally scalable path for shared transaction state, rolling callback counters, gateway runtime state, and half-open probe coordination.
-- Redis transaction saves use `SETNX`, order attempts use `INCR`, completion uses Lua, and half-open probe acquire/release/prune operations use Lua.
+- Redis transaction saves use `SETNX`, order attempts use `INCR`, completion uses Lua, and half-open probe acquisition uses Lua.
 - Redis callback stats are aggregated into minute buckets and expire after the configured retention window.
 
 ### Error Mapping
@@ -691,7 +684,7 @@ payu         initiated=3000 callbacks=3000 success=2854 failure=146 duplicates=5
 razorpay     initiated=5000 callbacks=5000 success=4764 failure=236 duplicates=98
 
 === Server Gateway Stats ===
-Health window: 900s, threshold: 0.90, min callbacks: 10, cooldown: 1800s, probes: 1, probe timeout: 60s
+Health window: 900s, threshold: 0.90, min callbacks: 10, cooldown: 1800s, probes: 1
 razorpay     enabled=true weight=50 state=healthy in_flight=0 total=5000 success=4764 failure=236 success_rate=0.9528
 payu         enabled=true weight=30 state=healthy in_flight=0 total=3000 success=2854 failure=146 success_rate=0.9513
 cashfree     enabled=true weight=20 state=healthy in_flight=0 total=2000 success=1898 failure=102 success_rate=0.9490
