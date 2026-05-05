@@ -11,11 +11,17 @@ const (
 )
 
 type GatewayRuntimeState struct {
-	Gateway          string       `json:"gateway"`
-	State            GatewayState `json:"state"`
-	UnhealthyUntil   time.Time    `json:"unhealthy_until,omitempty"`
-	HalfOpenInFlight int          `json:"half_open_in_flight"`
-	UpdatedAt        time.Time    `json:"updated_at"`
+	Gateway          string          `json:"gateway"`
+	State            GatewayState    `json:"state"`
+	UnhealthyUntil   time.Time       `json:"unhealthy_until,omitempty"`
+	HalfOpenInFlight int             `json:"half_open_in_flight"`
+	HalfOpenProbes   []HalfOpenProbe `json:"half_open_probes,omitempty"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+}
+
+type HalfOpenProbe struct {
+	TransactionID      string `json:"transaction_id"`
+	ExpiresAtUnixMilli int64  `json:"expires_at_unix_milli"`
 }
 
 type GatewayEvent struct {

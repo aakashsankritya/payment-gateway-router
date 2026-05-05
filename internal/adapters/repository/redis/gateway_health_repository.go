@@ -49,12 +49,39 @@ func (r *GatewayHealthRepository) Save(ctx context.Context, state domain.Gateway
 	return nil
 }
 
-func (r *GatewayHealthRepository) TryAcquireHalfOpenProbe(ctx context.Context, gateway string, maxInFlight int, now time.Time) (domain.GatewayRuntimeState, bool, error) {
+func (r *GatewayHealthRepository) PruneExpiredHalfOpenProbes(ctx context.Context, gateway string, now time.Time) (domain.GatewayRuntimeState, error) {
+	result, err := pruneExpiredProbesScript.Run(
+		ctx,
+		r.store.client,
+		[]string{r.stateKey(gateway)},
+		now.UnixMilli(),
+		now.UTC().Format(time.RFC3339Nano),
+	).Slice()
+	if err != nil {
+		return domain.GatewayRuntimeState{}, err
+	}
+	if len(result) == 0 {
+		return domain.GatewayRuntimeState{}, fmt.Errorf("unexpected redis prune response: %v", result)
+	}
+	code := fmt.Sprint(result[0])
+	if code == "missing" {
+		return domain.GatewayRuntimeState{}, fmt.Errorf("%w: gateway %q", domain.ErrNotFound, gateway)
+	}
+	if len(result) < 2 {
+		return domain.GatewayRuntimeState{}, fmt.Errorf("missing gateway state in redis prune response: %v", result)
+	}
+	return decodeGatewayState([]byte(fmt.Sprint(result[1])))
+}
+
+func (r *GatewayHealthRepository) TryAcquireHalfOpenProbe(ctx context.Context, gateway string, transactionID string, maxInFlight int, expiresAt time.Time, now time.Time) (domain.GatewayRuntimeState, bool, error) {
 	result, err := acquireProbeScript.Run(
 		ctx,
 		r.store.client,
 		[]string{r.stateKey(gateway)},
 		maxInFlight,
+		transactionID,
+		expiresAt.UnixMilli(),
+		now.UnixMilli(),
 		now.UTC().Format(time.RFC3339Nano),
 	).Slice()
 	if err != nil {
@@ -74,6 +101,34 @@ func (r *GatewayHealthRepository) TryAcquireHalfOpenProbe(ctx context.Context, g
 
 	state, err := decodeGatewayState([]byte(fmt.Sprint(result[1])))
 	return state, code == "acquired", err
+}
+
+func (r *GatewayHealthRepository) ReleaseHalfOpenProbe(ctx context.Context, gateway string, transactionID string, now time.Time) (domain.GatewayRuntimeState, bool, error) {
+	result, err := releaseProbeScript.Run(
+		ctx,
+		r.store.client,
+		[]string{r.stateKey(gateway)},
+		transactionID,
+		now.UnixMilli(),
+		now.UTC().Format(time.RFC3339Nano),
+	).Slice()
+	if err != nil {
+		return domain.GatewayRuntimeState{}, false, err
+	}
+	if len(result) == 0 {
+		return domain.GatewayRuntimeState{}, false, fmt.Errorf("unexpected redis release response: %v", result)
+	}
+
+	code := fmt.Sprint(result[0])
+	if code == "missing" {
+		return domain.GatewayRuntimeState{}, false, fmt.Errorf("%w: gateway %q", domain.ErrNotFound, gateway)
+	}
+	if len(result) < 2 {
+		return domain.GatewayRuntimeState{}, false, fmt.Errorf("missing gateway state in redis release response: %v", result)
+	}
+
+	state, err := decodeGatewayState([]byte(fmt.Sprint(result[1])))
+	return state, code == "released", err
 }
 
 func (r *GatewayHealthRepository) RecordEvent(ctx context.Context, event domain.GatewayEvent, retention time.Duration) error {
@@ -177,16 +232,107 @@ if state["state"] ~= "half_open" then
   return {"not_half_open", raw}
 end
 
-local in_flight = tonumber(state["half_open_in_flight"] or 0)
-local max = tonumber(ARGV[1])
-if in_flight >= max then
-  return {"full", raw}
+local active = {}
+local now_millis = tonumber(ARGV[4])
+for _, probe in ipairs(state["half_open_probes"] or {}) do
+  local expires_at = tonumber(probe["expires_at_unix_milli"] or 0)
+  if probe["transaction_id"] and expires_at > now_millis then
+    table.insert(active, probe)
+  end
 end
 
-state["half_open_in_flight"] = in_flight + 1
-state["updated_at"] = ARGV[2]
+local max = tonumber(ARGV[1])
+if #active > 0 then
+  state["half_open_probes"] = active
+else
+  state["half_open_probes"] = nil
+end
+state["half_open_in_flight"] = #active
+if #active >= max then
+  state["updated_at"] = ARGV[5]
+  local updated = cjson.encode(state)
+  redis.call("SET", KEYS[1], updated)
+  return {"full", updated}
+end
+
+table.insert(active, {
+  transaction_id = ARGV[2],
+  expires_at_unix_milli = tonumber(ARGV[3])
+})
+state["half_open_probes"] = active
+state["half_open_in_flight"] = #active
+state["updated_at"] = ARGV[5]
 
 local updated = cjson.encode(state)
 redis.call("SET", KEYS[1], updated)
 return {"acquired", updated}
+`)
+
+var releaseProbeScript = goredis.NewScript(`
+local raw = redis.call("GET", KEYS[1])
+if not raw then return {"missing"} end
+
+local state = cjson.decode(raw)
+if state["state"] ~= "half_open" then
+  return {"not_half_open", raw}
+end
+
+local active = {}
+local released = false
+local transaction_id = ARGV[1]
+local now_millis = tonumber(ARGV[2])
+for _, probe in ipairs(state["half_open_probes"] or {}) do
+  local expires_at = tonumber(probe["expires_at_unix_milli"] or 0)
+  if probe["transaction_id"] and expires_at > now_millis then
+    if probe["transaction_id"] == transaction_id then
+      released = true
+    else
+      table.insert(active, probe)
+    end
+  end
+end
+
+if #active > 0 then
+  state["half_open_probes"] = active
+else
+  state["half_open_probes"] = nil
+end
+state["half_open_in_flight"] = #active
+state["updated_at"] = ARGV[3]
+
+local updated = cjson.encode(state)
+redis.call("SET", KEYS[1], updated)
+if released then return {"released", updated} end
+return {"not_found", updated}
+`)
+
+var pruneExpiredProbesScript = goredis.NewScript(`
+local raw = redis.call("GET", KEYS[1])
+if not raw then return {"missing"} end
+
+local state = cjson.decode(raw)
+if state["state"] ~= "half_open" then
+  return {"ok", raw}
+end
+
+local active = {}
+local now_millis = tonumber(ARGV[1])
+for _, probe in ipairs(state["half_open_probes"] or {}) do
+  local expires_at = tonumber(probe["expires_at_unix_milli"] or 0)
+  if probe["transaction_id"] and expires_at > now_millis then
+    table.insert(active, probe)
+  end
+end
+
+if #active > 0 then
+  state["half_open_probes"] = active
+else
+  state["half_open_probes"] = nil
+end
+state["half_open_in_flight"] = #active
+state["updated_at"] = ARGV[2]
+
+local updated = cjson.encode(state)
+redis.call("SET", KEYS[1], updated)
+return {"ok", updated}
 `)

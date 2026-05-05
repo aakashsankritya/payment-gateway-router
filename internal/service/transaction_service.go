@@ -61,24 +61,37 @@ func NewTransactionService(
 }
 
 func (s *TransactionService) Initiate(ctx context.Context, input InitiateTransactionInput) (domain.Transaction, error) {
-	gateway, err := s.router.SelectGateway(ctx)
+	transactionID := s.idGenerator.NewID("txn")
+	selection, err := s.router.SelectGateway(ctx, transactionID)
 	if err != nil {
 		return domain.Transaction{}, err
+	}
+	gateway := selection.Gateway
+	releaseProbe := func(cause error) {
+		if !selection.HalfOpenProbe {
+			return
+		}
+		if releaseErr := s.health.ReleaseProbe(ctx, gateway.Name, transactionID); releaseErr != nil {
+			s.logger.Error("failed to release half-open probe", "transaction_id", transactionID, "gateway", gateway.Name, "cause", cause, "error", releaseErr)
+		}
 	}
 
 	client, ok := s.gateways.Client(gateway.Name)
 	if !ok {
-		return domain.Transaction{}, fmt.Errorf("gateway client %q is not registered", gateway.Name)
+		err := fmt.Errorf("gateway client %q is not registered", gateway.Name)
+		releaseProbe(err)
+		return domain.Transaction{}, err
 	}
 
 	attemptNo, err := s.transactions.NextAttempt(ctx, input.OrderID)
 	if err != nil {
+		releaseProbe(err)
 		return domain.Transaction{}, err
 	}
 
 	now := s.clock.Now()
 	transaction := domain.Transaction{
-		ID:                s.idGenerator.NewID("txn"),
+		ID:                transactionID,
 		OrderID:           input.OrderID,
 		AttemptNo:         attemptNo,
 		Amount:            input.Amount,
@@ -91,11 +104,13 @@ func (s *TransactionService) Initiate(ctx context.Context, input InitiateTransac
 
 	initiation, err := client.Initiate(ctx, transaction)
 	if err != nil {
+		releaseProbe(err)
 		return domain.Transaction{}, err
 	}
 	transaction.GatewayReferenceID = initiation.ReferenceID
 
 	if err := s.transactions.Save(ctx, transaction); err != nil {
+		releaseProbe(err)
 		return domain.Transaction{}, err
 	}
 
