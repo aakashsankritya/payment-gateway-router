@@ -18,7 +18,9 @@ type GatewayHealthRepository interface {
 	Ensure(ctx context.Context, gateway string, now time.Time) error
 	Get(ctx context.Context, gateway string) (domain.GatewayRuntimeState, error)
 	Save(ctx context.Context, state domain.GatewayRuntimeState) error
-	TryAcquireHalfOpenProbe(ctx context.Context, gateway string, maxInFlight int, now time.Time) (domain.GatewayRuntimeState, bool, error)
+	PruneExpiredHalfOpenProbes(ctx context.Context, gateway string, now time.Time) (domain.GatewayRuntimeState, error)
+	TryAcquireHalfOpenProbe(ctx context.Context, gateway string, transactionID string, maxInFlight int, expiresAt time.Time, now time.Time) (domain.GatewayRuntimeState, bool, error)
+	ReleaseHalfOpenProbe(ctx context.Context, gateway string, transactionID string, now time.Time) (domain.GatewayRuntimeState, bool, error)
 	RecordEvent(ctx context.Context, event domain.GatewayEvent, retention time.Duration) error
 	StatsSince(ctx context.Context, gateway string, since time.Time, until time.Time, bucketSize time.Duration) (domain.GatewayStats, error)
 }

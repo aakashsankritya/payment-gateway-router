@@ -28,6 +28,11 @@ type routingSnapshot struct {
 	expiresAt time.Time
 }
 
+type GatewaySelection struct {
+	Gateway       domain.GatewayConfig
+	HalfOpenProbe bool
+}
+
 func NewRoutingService(configProvider ports.GatewayConfigProvider, healthService *HealthService, clock Clock, logger *slog.Logger) *RoutingService {
 	return &RoutingService{
 		configProvider: configProvider,
@@ -48,36 +53,36 @@ func (s *RoutingService) SetCacheTTL(ttl time.Duration) {
 	s.cache = routingSnapshot{}
 }
 
-func (s *RoutingService) SelectGateway(ctx context.Context) (domain.GatewayConfig, error) {
+func (s *RoutingService) SelectGateway(ctx context.Context, transactionID string) (GatewaySelection, error) {
 	snapshot, err := s.snapshot(ctx)
 	if err != nil {
-		return domain.GatewayConfig{}, err
+		return GatewaySelection{}, err
 	}
 
 	if len(snapshot.probes) > 0 {
 		selected, ok := s.selectWeighted(snapshot.probes)
 		if !ok {
-			return domain.GatewayConfig{}, domain.ErrNoAvailableGateway
+			return GatewaySelection{}, domain.ErrNoAvailableGateway
 		}
-		if err := s.healthService.MarkProbeSelected(ctx, selected.Name); err != nil {
+		if err := s.healthService.MarkProbeSelected(ctx, selected.Name, transactionID); err != nil {
 			s.invalidateCache()
 			if len(snapshot.healthy) == 0 {
-				return domain.GatewayConfig{}, err
+				return GatewaySelection{}, err
 			}
 		} else {
 			s.logger.Info("selected half-open probe gateway", "gateway", selected.Name)
-			return selected, nil
+			return GatewaySelection{Gateway: selected, HalfOpenProbe: true}, nil
 		}
 	}
 
 	selected, ok := s.selectWeighted(snapshot.healthy)
 	if !ok {
 		s.logger.Warn("no healthy gateway available")
-		return domain.GatewayConfig{}, domain.ErrNoAvailableGateway
+		return GatewaySelection{}, domain.ErrNoAvailableGateway
 	}
 
 	s.logger.Info("selected healthy gateway", "gateway", selected.Name)
-	return selected, nil
+	return GatewaySelection{Gateway: selected}, nil
 }
 
 func (s *RoutingService) snapshot(ctx context.Context) (routingSnapshot, error) {

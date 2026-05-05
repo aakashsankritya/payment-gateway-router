@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"payment-gateway-router/internal/adapters/gateway/mock"
 	"payment-gateway-router/internal/adapters/repository/memory"
 	"payment-gateway-router/internal/domain"
+	"payment-gateway-router/internal/ports"
 )
 
 type staticConfigProvider struct {
@@ -44,6 +46,10 @@ func (g *sequenceIDGenerator) NewID(prefix string) string {
 }
 
 func newTestServices(cfg domain.AppConfig, clock *mutableClock) (*TransactionService, *HealthService) {
+	return newTestServicesWithRegistry(cfg, clock, mock.Registry{})
+}
+
+func newTestServicesWithRegistry(cfg domain.AppConfig, clock *mutableClock, registry ports.GatewayClientRegistry) (*TransactionService, *HealthService) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	provider := staticConfigProvider{cfg: cfg.WithDefaults()}
 	healthRepo := memory.NewGatewayHealthRepository()
@@ -53,12 +59,32 @@ func newTestServices(cfg domain.AppConfig, clock *mutableClock) (*TransactionSer
 		memory.NewTransactionRepository(),
 		router,
 		health,
-		mock.Registry{},
+		registry,
 		&sequenceIDGenerator{},
 		clock,
 		logger,
 	)
 	return transactions, health
+}
+
+type controllableGatewayRegistry struct {
+	failInitiate bool
+}
+
+func (r *controllableGatewayRegistry) Client(gateway string) (ports.PaymentGatewayClient, bool) {
+	return controllableGatewayClient{gateway: gateway, registry: r}, true
+}
+
+type controllableGatewayClient struct {
+	gateway  string
+	registry *controllableGatewayRegistry
+}
+
+func (c controllableGatewayClient) Initiate(ctx context.Context, transaction domain.Transaction) (domain.GatewayInitiation, error) {
+	if c.registry.failInitiate {
+		return domain.GatewayInitiation{}, errors.New("gateway initiate failed")
+	}
+	return domain.GatewayInitiation{ReferenceID: fmt.Sprintf("mock_%s_%s", c.gateway, transaction.ID)}, nil
 }
 
 func TestAtomicWeightedSelectionDistributesByWeight(t *testing.T) {
@@ -236,6 +262,164 @@ func TestHalfOpenProbeFlow(t *testing.T) {
 	}
 	if state.State != domain.GatewayStateHealthy {
 		t.Fatalf("state = %s, want healthy", state.State)
+	}
+}
+
+func TestHalfOpenProbeSlotReleasedWhenInitiateFails(t *testing.T) {
+	ctx := context.Background()
+	clock := &mutableClock{now: time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)}
+	registry := &controllableGatewayRegistry{}
+	transactions, health := newTestServicesWithRegistry(singleGatewayConfig(1, 1, 0.90, 60), clock, registry)
+
+	failed, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD123", Amount: 499})
+	if err != nil {
+		t.Fatalf("initiate failed: %v", err)
+	}
+	if _, err := transactions.Callback(ctx, CallbackInput{
+		TransactionID: failed.ID,
+		OrderID:       failed.OrderID,
+		Gateway:       failed.Gateway,
+		Status:        domain.TransactionStatusFailure,
+	}); err != nil {
+		t.Fatalf("failure callback failed: %v", err)
+	}
+
+	clock.Advance(61 * time.Second)
+	registry.failInitiate = true
+	_, err = transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD124", Amount: 500})
+	if err == nil {
+		t.Fatal("probe initiate should fail")
+	}
+
+	state, err := health.State(ctx, "razorpay")
+	if err != nil {
+		t.Fatalf("state failed: %v", err)
+	}
+	if state.State != domain.GatewayStateHalfOpen || state.HalfOpenInFlight != 0 {
+		t.Fatalf("state = %+v, want half_open with no in-flight probes after failed initiate", state)
+	}
+
+	registry.failInitiate = false
+	probe, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD125", Amount: 501})
+	if err != nil {
+		t.Fatalf("replacement probe initiate failed: %v", err)
+	}
+	if probe.Gateway != "razorpay" {
+		t.Fatalf("probe gateway = %s, want razorpay", probe.Gateway)
+	}
+}
+
+func TestHalfOpenProbeSlotExpiresWhenCallbackNeverArrives(t *testing.T) {
+	ctx := context.Background()
+	clock := &mutableClock{now: time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)}
+	cfg := singleGatewayConfig(1, 1, 0.90, 60)
+	cfg.Routing.HalfOpenProbeTimeoutSeconds = 5
+	transactions, health := newTestServices(cfg, clock)
+
+	failed, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD123", Amount: 499})
+	if err != nil {
+		t.Fatalf("initiate failed: %v", err)
+	}
+	if _, err := transactions.Callback(ctx, CallbackInput{
+		TransactionID: failed.ID,
+		OrderID:       failed.OrderID,
+		Gateway:       failed.Gateway,
+		Status:        domain.TransactionStatusFailure,
+	}); err != nil {
+		t.Fatalf("failure callback failed: %v", err)
+	}
+
+	clock.Advance(61 * time.Second)
+	if _, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD124", Amount: 500}); err != nil {
+		t.Fatalf("probe initiate failed: %v", err)
+	}
+
+	state, err := health.State(ctx, "razorpay")
+	if err != nil {
+		t.Fatalf("state failed: %v", err)
+	}
+	if state.State != domain.GatewayStateHalfOpen || state.HalfOpenInFlight != 1 {
+		t.Fatalf("state = %+v, want one in-flight probe", state)
+	}
+
+	clock.Advance(6 * time.Second)
+	replacement, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD125", Amount: 501})
+	if err != nil {
+		t.Fatalf("replacement probe after timeout failed: %v", err)
+	}
+	if replacement.Gateway != "razorpay" {
+		t.Fatalf("replacement gateway = %s, want razorpay", replacement.Gateway)
+	}
+
+	state, err = health.State(ctx, "razorpay")
+	if err != nil {
+		t.Fatalf("state failed: %v", err)
+	}
+	if state.State != domain.GatewayStateHalfOpen || state.HalfOpenInFlight != 1 {
+		t.Fatalf("state = %+v, want exactly one replacement in-flight probe", state)
+	}
+}
+
+func TestNonProbeCallbackDoesNotCompleteHalfOpenProbe(t *testing.T) {
+	ctx := context.Background()
+	clock := &mutableClock{now: time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)}
+	transactions, health := newTestServices(singleGatewayConfig(1, 1, 0.90, 60), clock)
+
+	old, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD122", Amount: 498})
+	if err != nil {
+		t.Fatalf("old initiate failed: %v", err)
+	}
+	failed, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD123", Amount: 499})
+	if err != nil {
+		t.Fatalf("failed initiate failed: %v", err)
+	}
+	if _, err := transactions.Callback(ctx, CallbackInput{
+		TransactionID: failed.ID,
+		OrderID:       failed.OrderID,
+		Gateway:       failed.Gateway,
+		Status:        domain.TransactionStatusFailure,
+	}); err != nil {
+		t.Fatalf("failure callback failed: %v", err)
+	}
+
+	clock.Advance(61 * time.Second)
+	probe, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD124", Amount: 500})
+	if err != nil {
+		t.Fatalf("probe initiate failed: %v", err)
+	}
+
+	if _, err := transactions.Callback(ctx, CallbackInput{
+		TransactionID: old.ID,
+		OrderID:       old.OrderID,
+		Gateway:       old.Gateway,
+		Status:        domain.TransactionStatusSuccess,
+	}); err != nil {
+		t.Fatalf("old callback failed: %v", err)
+	}
+
+	state, err := health.State(ctx, "razorpay")
+	if err != nil {
+		t.Fatalf("state failed: %v", err)
+	}
+	if state.State != domain.GatewayStateHalfOpen || state.HalfOpenInFlight != 1 {
+		t.Fatalf("state = %+v, want original half-open probe still in flight", state)
+	}
+
+	if _, err := transactions.Callback(ctx, CallbackInput{
+		TransactionID: probe.ID,
+		OrderID:       probe.OrderID,
+		Gateway:       probe.Gateway,
+		Status:        domain.TransactionStatusSuccess,
+	}); err != nil {
+		t.Fatalf("probe callback failed: %v", err)
+	}
+
+	state, err = health.State(ctx, "razorpay")
+	if err != nil {
+		t.Fatalf("state failed: %v", err)
+	}
+	if state.State != domain.GatewayStateHealthy || state.HalfOpenInFlight != 0 {
+		t.Fatalf("state = %+v, want healthy after actual probe callback", state)
 	}
 }
 

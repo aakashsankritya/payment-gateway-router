@@ -42,11 +42,12 @@ type callbackRequest struct {
 
 type gatewayResponse struct {
 	Routing struct {
-		HealthWindowSeconds      int     `json:"health_window_seconds"`
-		UnhealthyCooldownSeconds int     `json:"unhealthy_cooldown_seconds"`
-		MinCallbackCount         int     `json:"min_callback_count"`
-		SuccessRateThreshold     float64 `json:"success_rate_threshold"`
-		HalfOpenProbeCount       int     `json:"half_open_probe_count"`
+		HealthWindowSeconds         int     `json:"health_window_seconds"`
+		UnhealthyCooldownSeconds    int     `json:"unhealthy_cooldown_seconds"`
+		MinCallbackCount            int     `json:"min_callback_count"`
+		SuccessRateThreshold        float64 `json:"success_rate_threshold"`
+		HalfOpenProbeCount          int     `json:"half_open_probe_count"`
+		HalfOpenProbeTimeoutSeconds int     `json:"half_open_probe_timeout_seconds"`
 	} `json:"routing"`
 	Gateways []gatewayStatus `json:"gateways"`
 }
@@ -443,12 +444,13 @@ func printClientStats(cfg simulatorConfig, agg *aggregate, duration time.Duratio
 
 func printServerStats(response gatewayResponse) {
 	fmt.Println("\n=== Server Gateway Stats ===")
-	fmt.Printf("Health window: %ds, threshold: %.2f, min callbacks: %d, cooldown: %ds, probes: %d\n",
+	fmt.Printf("Health window: %ds, threshold: %.2f, min callbacks: %d, cooldown: %ds, probes: %d, probe timeout: %ds\n",
 		response.Routing.HealthWindowSeconds,
 		response.Routing.SuccessRateThreshold,
 		response.Routing.MinCallbackCount,
 		response.Routing.UnhealthyCooldownSeconds,
 		response.Routing.HalfOpenProbeCount,
+		response.Routing.HalfOpenProbeTimeoutSeconds,
 	)
 	for _, gateway := range response.Gateways {
 		fmt.Printf("%-12s enabled=%t weight=%d state=%s in_flight=%d total=%d success=%d failure=%d success_rate=%.4f\n",

@@ -63,22 +63,44 @@ func (s *HealthService) PrepareForRouting(ctx context.Context, gateway string, r
 		s.setCachedState(state, now)
 		s.logger.Info("gateway moved to half-open", "gateway", gateway)
 	}
+	if state.State == domain.GatewayStateHalfOpen {
+		state, err = s.repository.PruneExpiredHalfOpenProbes(ctx, gateway, now)
+		if err != nil {
+			return domain.GatewayRuntimeState{}, err
+		}
+		s.setCachedState(state, now)
+	}
 
 	return state, nil
 }
 
-func (s *HealthService) MarkProbeSelected(ctx context.Context, gateway string) error {
+func (s *HealthService) MarkProbeSelected(ctx context.Context, gateway string, transactionID string) error {
 	cfg := s.configProvider.Current(ctx).WithDefaults()
-	state, acquired, err := s.repository.TryAcquireHalfOpenProbe(ctx, gateway, cfg.Routing.HalfOpenProbeCount, s.clock.Now())
+	now := s.clock.Now()
+	expiresAt := now.Add(time.Duration(cfg.Routing.HalfOpenProbeTimeoutSeconds) * time.Second)
+	state, acquired, err := s.repository.TryAcquireHalfOpenProbe(ctx, gateway, transactionID, cfg.Routing.HalfOpenProbeCount, expiresAt, now)
 	if err != nil {
 		return err
 	}
-	s.setCachedState(state, s.clock.Now())
+	s.setCachedState(state, now)
 	if !acquired {
 		s.logger.Warn("half-open probe was not acquired", "gateway", gateway, "state", state.State, "in_flight", state.HalfOpenInFlight)
 		return domain.ErrNoAvailableGateway
 	}
 	s.logger.Info("half-open probe selected", "gateway", gateway, "in_flight", state.HalfOpenInFlight)
+	return nil
+}
+
+func (s *HealthService) ReleaseProbe(ctx context.Context, gateway string, transactionID string) error {
+	now := s.clock.Now()
+	state, released, err := s.repository.ReleaseHalfOpenProbe(ctx, gateway, transactionID, now)
+	if err != nil {
+		return err
+	}
+	s.setCachedState(state, now)
+	if released {
+		s.logger.Info("half-open probe released", "gateway", gateway, "transaction_id", transactionID, "in_flight", state.HalfOpenInFlight)
+	}
 	return nil
 }
 
@@ -114,12 +136,20 @@ func (s *HealthService) RecordOutcome(ctx context.Context, gateway string, trans
 
 	switch state.State {
 	case domain.GatewayStateHalfOpen:
-		if state.HalfOpenInFlight > 0 {
-			state.HalfOpenInFlight--
+		releasedState, released, err := s.repository.ReleaseHalfOpenProbe(ctx, gateway, transactionID, now)
+		if err != nil {
+			return domain.GatewayRuntimeState{}, domain.GatewayStats{}, err
+		}
+		state = releasedState
+		if !released {
+			s.setCachedState(state, now)
+			return state, stats, nil
 		}
 		if status == domain.TransactionStatusSuccess {
 			state.State = domain.GatewayStateHealthy
 			state.UnhealthyUntil = time.Time{}
+			state.HalfOpenInFlight = 0
+			state.HalfOpenProbes = nil
 			state.UpdatedAt = now
 			s.logger.Info("gateway recovered from half-open probe", "gateway", gateway)
 		} else if status == domain.TransactionStatusFailure {
@@ -130,6 +160,7 @@ func (s *HealthService) RecordOutcome(ctx context.Context, gateway string, trans
 		if state.UnhealthyUntil.IsZero() || !now.Before(state.UnhealthyUntil) {
 			state.State = domain.GatewayStateHalfOpen
 			state.HalfOpenInFlight = 0
+			state.HalfOpenProbes = nil
 			state.UpdatedAt = now
 		}
 	default:
@@ -139,6 +170,8 @@ func (s *HealthService) RecordOutcome(ctx context.Context, gateway string, trans
 		} else {
 			state.State = domain.GatewayStateHealthy
 			state.UnhealthyUntil = time.Time{}
+			state.HalfOpenInFlight = 0
+			state.HalfOpenProbes = nil
 			state.UpdatedAt = now
 		}
 	}
@@ -159,6 +192,12 @@ func (s *HealthService) State(ctx context.Context, gateway string) (domain.Gatew
 	if err != nil {
 		return domain.GatewayRuntimeState{}, err
 	}
+	if state.State == domain.GatewayStateHalfOpen {
+		state, err = s.repository.PruneExpiredHalfOpenProbes(ctx, gateway, now)
+		if err != nil {
+			return domain.GatewayRuntimeState{}, err
+		}
+	}
 	s.setCachedState(state, now)
 	return state, nil
 }
@@ -174,6 +213,7 @@ func (s *HealthService) markUnhealthy(state domain.GatewayRuntimeState, routing 
 	state.State = domain.GatewayStateUnhealthy
 	state.UnhealthyUntil = now.Add(time.Duration(routing.UnhealthyCooldownSeconds) * time.Second)
 	state.HalfOpenInFlight = 0
+	state.HalfOpenProbes = nil
 	state.UpdatedAt = now
 	return state
 }

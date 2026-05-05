@@ -56,7 +56,24 @@ func (r *GatewayHealthRepository) Save(ctx context.Context, state domain.Gateway
 	return nil
 }
 
-func (r *GatewayHealthRepository) TryAcquireHalfOpenProbe(ctx context.Context, gateway string, maxInFlight int, now time.Time) (domain.GatewayRuntimeState, bool, error) {
+func (r *GatewayHealthRepository) PruneExpiredHalfOpenProbes(ctx context.Context, gateway string, now time.Time) (domain.GatewayRuntimeState, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	state, exists := r.states[gateway]
+	if !exists {
+		return domain.GatewayRuntimeState{}, fmt.Errorf("%w: gateway %q", domain.ErrNotFound, gateway)
+	}
+	if state.State != domain.GatewayStateHalfOpen {
+		return state, nil
+	}
+	state = pruneExpiredHalfOpenProbes(state, now)
+	state.UpdatedAt = now
+	r.states[gateway] = state
+	return state, nil
+}
+
+func (r *GatewayHealthRepository) TryAcquireHalfOpenProbe(ctx context.Context, gateway string, transactionID string, maxInFlight int, expiresAt time.Time, now time.Time) (domain.GatewayRuntimeState, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -67,13 +84,47 @@ func (r *GatewayHealthRepository) TryAcquireHalfOpenProbe(ctx context.Context, g
 	if state.State != domain.GatewayStateHalfOpen {
 		return state, false, nil
 	}
+	state = pruneExpiredHalfOpenProbes(state, now)
 	if state.HalfOpenInFlight >= maxInFlight {
+		r.states[gateway] = state
 		return state, false, nil
 	}
-	state.HalfOpenInFlight++
+	state.HalfOpenProbes = append(state.HalfOpenProbes, domain.HalfOpenProbe{
+		TransactionID:      transactionID,
+		ExpiresAtUnixMilli: expiresAt.UnixMilli(),
+	})
+	state.HalfOpenInFlight = len(state.HalfOpenProbes)
 	state.UpdatedAt = now
 	r.states[gateway] = state
 	return state, true, nil
+}
+
+func (r *GatewayHealthRepository) ReleaseHalfOpenProbe(ctx context.Context, gateway string, transactionID string, now time.Time) (domain.GatewayRuntimeState, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	state, exists := r.states[gateway]
+	if !exists {
+		return domain.GatewayRuntimeState{}, false, fmt.Errorf("%w: gateway %q", domain.ErrNotFound, gateway)
+	}
+	if state.State != domain.GatewayStateHalfOpen {
+		return state, false, nil
+	}
+	state = pruneExpiredHalfOpenProbes(state, now)
+	probes := state.HalfOpenProbes[:0]
+	released := false
+	for _, probe := range state.HalfOpenProbes {
+		if probe.TransactionID == transactionID {
+			released = true
+			continue
+		}
+		probes = append(probes, probe)
+	}
+	state.HalfOpenProbes = probes
+	state.HalfOpenInFlight = len(probes)
+	state.UpdatedAt = now
+	r.states[gateway] = state
+	return state, released, nil
 }
 
 func (r *GatewayHealthRepository) RecordEvent(ctx context.Context, event domain.GatewayEvent, retention time.Duration) error {
@@ -112,4 +163,21 @@ func (r *GatewayHealthRepository) StatsSince(ctx context.Context, gateway string
 		stats.SuccessRate = float64(stats.Successes) / float64(stats.Total)
 	}
 	return stats, nil
+}
+
+func pruneExpiredHalfOpenProbes(state domain.GatewayRuntimeState, now time.Time) domain.GatewayRuntimeState {
+	if len(state.HalfOpenProbes) == 0 {
+		state.HalfOpenInFlight = 0
+		return state
+	}
+	nowMillis := now.UnixMilli()
+	probes := state.HalfOpenProbes[:0]
+	for _, probe := range state.HalfOpenProbes {
+		if probe.TransactionID != "" && probe.ExpiresAtUnixMilli > nowMillis {
+			probes = append(probes, probe)
+		}
+	}
+	state.HalfOpenProbes = probes
+	state.HalfOpenInFlight = len(probes)
+	return state
 }

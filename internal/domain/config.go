@@ -11,11 +11,12 @@ type AppConfig struct {
 }
 
 type RoutingConfig struct {
-	HealthWindowSeconds      int     `json:"health_window_seconds" yaml:"health_window_seconds"`
-	UnhealthyCooldownSeconds int     `json:"unhealthy_cooldown_seconds" yaml:"unhealthy_cooldown_seconds"`
-	MinCallbackCount         int     `json:"min_callback_count" yaml:"min_callback_count"`
-	SuccessRateThreshold     float64 `json:"success_rate_threshold" yaml:"success_rate_threshold"`
-	HalfOpenProbeCount       int     `json:"half_open_probe_count" yaml:"half_open_probe_count"`
+	HealthWindowSeconds         int     `json:"health_window_seconds" yaml:"health_window_seconds"`
+	UnhealthyCooldownSeconds    int     `json:"unhealthy_cooldown_seconds" yaml:"unhealthy_cooldown_seconds"`
+	MinCallbackCount            int     `json:"min_callback_count" yaml:"min_callback_count"`
+	SuccessRateThreshold        float64 `json:"success_rate_threshold" yaml:"success_rate_threshold"`
+	HalfOpenProbeCount          int     `json:"half_open_probe_count" yaml:"half_open_probe_count"`
+	HalfOpenProbeTimeoutSeconds int     `json:"half_open_probe_timeout_seconds" yaml:"half_open_probe_timeout_seconds"`
 }
 
 type GatewayConfig struct {
@@ -26,11 +27,12 @@ type GatewayConfig struct {
 
 func DefaultRoutingConfig() RoutingConfig {
 	return RoutingConfig{
-		HealthWindowSeconds:      15 * 60,
-		UnhealthyCooldownSeconds: 30 * 60,
-		MinCallbackCount:         10,
-		SuccessRateThreshold:     0.90,
-		HalfOpenProbeCount:       1,
+		HealthWindowSeconds:         15 * 60,
+		UnhealthyCooldownSeconds:    30 * 60,
+		MinCallbackCount:            10,
+		SuccessRateThreshold:        0.90,
+		HalfOpenProbeCount:          1,
+		HalfOpenProbeTimeoutSeconds: 60,
 	}
 }
 
@@ -53,6 +55,9 @@ func (c AppConfig) WithDefaults() AppConfig {
 	}
 	if c.Routing.HalfOpenProbeCount <= 0 {
 		c.Routing.HalfOpenProbeCount = defaults.HalfOpenProbeCount
+	}
+	if c.Routing.HalfOpenProbeTimeoutSeconds <= 0 {
+		c.Routing.HalfOpenProbeTimeoutSeconds = defaults.HalfOpenProbeTimeoutSeconds
 	}
 	return c
 }
