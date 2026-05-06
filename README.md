@@ -689,3 +689,20 @@ razorpay     enabled=true weight=50 state=healthy in_flight=0 total=5000 success
 payu         enabled=true weight=30 state=healthy in_flight=0 total=3000 success=2854 failure=146 success_rate=0.9513
 cashfree     enabled=true weight=20 state=healthy in_flight=0 total=2000 success=1898 failure=102 success_rate=0.9490
 ```
+
+## OrderId based fallback scenario - if previous attempted gateway has error threshold for given orderID
+
+```
+=== Order Gateway Blacklist Scenario ===
+Order ID: ORD-SIM-BLACKLIST
+Failure threshold: 2
+attempt=1 gateway=razorpay failure_count_for_gateway=1
+attempt=2 gateway=razorpay failure_count_for_gateway=2
+blacklisted_gateway=razorpay next_gateway=payu result=passed
+
+=== Server Gateway Stats ===
+Health window: 900s, threshold: 0.90, min callbacks: 10, cooldown: 1800s, probes: 1, probe timeout: 60s, order gateway failure threshold: 2
+razorpay     enabled=true weight=50 state=healthy in_flight=0 total=5002 success=4764 failure=238 success_rate=0.9524
+payu         enabled=true weight=30 state=healthy in_flight=0 total=3000 success=2848 failure=152 success_rate=0.9493
+cashfree     enabled=true weight=20 state=healthy in_flight=0 total=2000 success=1885 failure=115 success_rate=0.9425
+```
