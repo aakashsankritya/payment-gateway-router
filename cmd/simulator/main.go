@@ -42,12 +42,13 @@ type callbackRequest struct {
 
 type gatewayResponse struct {
 	Routing struct {
-		HealthWindowSeconds         int     `json:"health_window_seconds"`
-		UnhealthyCooldownSeconds    int     `json:"unhealthy_cooldown_seconds"`
-		MinCallbackCount            int     `json:"min_callback_count"`
-		SuccessRateThreshold        float64 `json:"success_rate_threshold"`
-		HalfOpenProbeCount          int     `json:"half_open_probe_count"`
-		HalfOpenProbeTimeoutSeconds int     `json:"half_open_probe_timeout_seconds"`
+		HealthWindowSeconds          int     `json:"health_window_seconds"`
+		UnhealthyCooldownSeconds     int     `json:"unhealthy_cooldown_seconds"`
+		MinCallbackCount             int     `json:"min_callback_count"`
+		SuccessRateThreshold         float64 `json:"success_rate_threshold"`
+		HalfOpenProbeCount           int     `json:"half_open_probe_count"`
+		HalfOpenProbeTimeoutSeconds  int     `json:"half_open_probe_timeout_seconds"`
+		OrderGatewayFailureThreshold int     `json:"order_gateway_failure_threshold"`
 	} `json:"routing"`
 	Gateways []gatewayStatus `json:"gateways"`
 }
@@ -74,6 +75,7 @@ type gatewayStatus struct {
 
 type simulatorConfig struct {
 	baseURL       string
+	scenario      string
 	total         int
 	concurrency   int
 	successRate   float64
@@ -82,6 +84,7 @@ type simulatorConfig struct {
 	amount        float64
 	timeout       time.Duration
 	orderPrefix   string
+	maxAttempts   int
 }
 
 type result struct {
@@ -140,6 +143,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "service health check failed:", err)
 		os.Exit(1)
 	}
+	if cfg.scenario == "order-blacklist" {
+		if err := runOrderBlacklistScenario(ctx, client, cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "order blacklist scenario failed:", err)
+			os.Exit(1)
+		}
+		if gateways, err := fetchGatewayStats(ctx, client, cfg.baseURL); err != nil {
+			fmt.Fprintln(os.Stderr, "failed to fetch server gateway stats:", err)
+		} else {
+			printServerStats(gateways)
+		}
+		return
+	}
 
 	start := time.Now()
 	agg := &aggregate{byGateway: make(map[string]*gatewayAggregate)}
@@ -187,6 +202,7 @@ func main() {
 func parseFlags() simulatorConfig {
 	var cfg simulatorConfig
 	flag.StringVar(&cfg.baseURL, "base-url", "http://localhost:8080", "Payment Gateway Router base URL")
+	flag.StringVar(&cfg.scenario, "scenario", "traffic", "scenario to run: traffic or order-blacklist")
 	flag.IntVar(&cfg.total, "total", 1000, "number of transactions to initiate")
 	flag.IntVar(&cfg.concurrency, "concurrency", 50, "number of concurrent simulator workers")
 	flag.Float64Var(&cfg.successRate, "success-rate", 0.95, "probability that a callback is success")
@@ -195,6 +211,7 @@ func parseFlags() simulatorConfig {
 	flag.Float64Var(&cfg.amount, "amount", 499.0, "transaction amount")
 	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Second, "HTTP request timeout")
 	flag.StringVar(&cfg.orderPrefix, "order-prefix", "ORD-SIM", "order ID prefix")
+	flag.IntVar(&cfg.maxAttempts, "max-attempts", 20, "maximum attempts for deterministic scenarios")
 	flag.Parse()
 	cfg.baseURL = strings.TrimRight(cfg.baseURL, "/")
 	return cfg
@@ -219,23 +236,82 @@ func (c simulatorConfig) validate() error {
 	if c.timeout <= 0 {
 		return fmt.Errorf("timeout must be > 0")
 	}
+	if c.scenario != "traffic" && c.scenario != "order-blacklist" {
+		return fmt.Errorf("scenario must be traffic or order-blacklist")
+	}
+	if c.maxAttempts <= 0 {
+		return fmt.Errorf("max-attempts must be > 0")
+	}
+	return nil
+}
+
+func runOrderBlacklistScenario(ctx context.Context, client *http.Client, cfg simulatorConfig) error {
+	gateways, err := fetchGatewayStats(ctx, client, cfg.baseURL)
+	if err != nil {
+		return err
+	}
+	enabledGateways := 0
+	for _, gateway := range gateways.Gateways {
+		if gateway.Enabled {
+			enabledGateways++
+		}
+	}
+	if enabledGateways < 2 {
+		return fmt.Errorf("order-blacklist scenario needs at least two enabled gateways")
+	}
+
+	threshold := gateways.Routing.OrderGatewayFailureThreshold
+	if threshold <= 0 {
+		threshold = 2
+	}
+
+	orderID := cfg.orderPrefix + "-BLACKLIST"
+	failuresByGateway := map[string]int{}
+	blacklistedGateway := ""
+
+	fmt.Printf("=== Order Gateway Blacklist Scenario ===\n")
+	fmt.Printf("Order ID: %s\n", orderID)
+	fmt.Printf("Failure threshold: %d\n", threshold)
+
+	for attempt := 1; attempt <= cfg.maxAttempts; attempt++ {
+		transaction, err := initiate(ctx, client, cfg, orderID)
+		if err != nil {
+			return fmt.Errorf("attempt %d initiate failed before blacklist threshold was reached: %w", attempt, err)
+		}
+
+		if err := sendCallback(ctx, client, cfg.baseURL, transaction, "failure"); err != nil {
+			return fmt.Errorf("attempt %d failure callback failed: %w", attempt, err)
+		}
+
+		failuresByGateway[transaction.Gateway]++
+		fmt.Printf("attempt=%d gateway=%s failure_count_for_gateway=%d\n", attempt, transaction.Gateway, failuresByGateway[transaction.Gateway])
+		if failuresByGateway[transaction.Gateway] >= threshold {
+			blacklistedGateway = transaction.Gateway
+			break
+		}
+	}
+
+	if blacklistedGateway == "" {
+		return fmt.Errorf("no gateway reached failure threshold within %d attempts", cfg.maxAttempts)
+	}
+
+	next, err := initiate(ctx, client, cfg, orderID)
+	if err != nil {
+		return fmt.Errorf("post-blacklist initiate failed: %w", err)
+	}
+	if next.Gateway == blacklistedGateway {
+		return fmt.Errorf("blacklisted gateway %q was selected again for order %q", blacklistedGateway, orderID)
+	}
+
+	fmt.Printf("blacklisted_gateway=%s next_gateway=%s result=passed\n", blacklistedGateway, next.Gateway)
 	return nil
 }
 
 func runTransaction(ctx context.Context, client *http.Client, cfg simulatorConfig, random *rand.Rand, id int) result {
 	orderID := fmt.Sprintf("%s-%d", cfg.orderPrefix, id)
-	initiatePayload := initiateRequest{
-		OrderID: orderID,
-		Amount:  cfg.amount,
-		PaymentInstrument: map[string]any{
-			"type":        "card",
-			"card_number": "****",
-			"expiry":      "12/30",
-		},
-	}
 
 	start := time.Now()
-	transaction, err := postJSON[transactionResponse](ctx, client, cfg.baseURL+"/transactions/initiate", initiatePayload)
+	transaction, err := initiate(ctx, client, cfg, orderID)
 	item := result{initiateLatency: time.Since(start), initiateErr: err}
 	if err != nil {
 		return item
@@ -251,18 +327,8 @@ func runTransaction(ctx context.Context, client *http.Client, cfg simulatorConfi
 	if random.Float64() < cfg.successRate {
 		status = "success"
 	}
-	callbackPayload := callbackRequest{
-		TransactionID: transaction.TransactionID,
-		OrderID:       transaction.OrderID,
-		Gateway:       transaction.Gateway,
-		Status:        status,
-	}
-	if status == "failure" {
-		callbackPayload.Reason = "simulated_failure"
-	}
-
 	start = time.Now()
-	if _, err := postJSON[map[string]any](ctx, client, cfg.baseURL+"/transactions/callback", callbackPayload); err != nil {
+	if err := sendCallback(ctx, client, cfg.baseURL, transaction, status); err != nil {
 		item.callbackLatency = time.Since(start)
 		item.callbackErr = err
 		return item
@@ -273,10 +339,37 @@ func runTransaction(ctx context.Context, client *http.Client, cfg simulatorConfi
 
 	if random.Float64() < cfg.duplicateRate {
 		item.duplicateSent = true
-		_, _ = postJSON[map[string]any](ctx, client, cfg.baseURL+"/transactions/callback", callbackPayload)
+		_ = sendCallback(ctx, client, cfg.baseURL, transaction, status)
 	}
 
 	return item
+}
+
+func initiate(ctx context.Context, client *http.Client, cfg simulatorConfig, orderID string) (transactionResponse, error) {
+	payload := initiateRequest{
+		OrderID: orderID,
+		Amount:  cfg.amount,
+		PaymentInstrument: map[string]any{
+			"type":        "card",
+			"card_number": "****",
+			"expiry":      "12/30",
+		},
+	}
+	return postJSON[transactionResponse](ctx, client, cfg.baseURL+"/transactions/initiate", payload)
+}
+
+func sendCallback(ctx context.Context, client *http.Client, baseURL string, transaction transactionResponse, status string) error {
+	payload := callbackRequest{
+		TransactionID: transaction.TransactionID,
+		OrderID:       transaction.OrderID,
+		Gateway:       transaction.Gateway,
+		Status:        status,
+	}
+	if status == "failure" {
+		payload.Reason = "simulated_failure"
+	}
+	_, err := postJSON[map[string]any](ctx, client, baseURL+"/transactions/callback", payload)
+	return err
 }
 
 func postJSON[T any](ctx context.Context, client *http.Client, url string, payload any) (T, error) {
@@ -444,13 +537,14 @@ func printClientStats(cfg simulatorConfig, agg *aggregate, duration time.Duratio
 
 func printServerStats(response gatewayResponse) {
 	fmt.Println("\n=== Server Gateway Stats ===")
-	fmt.Printf("Health window: %ds, threshold: %.2f, min callbacks: %d, cooldown: %ds, probes: %d, probe timeout: %ds\n",
+	fmt.Printf("Health window: %ds, threshold: %.2f, min callbacks: %d, cooldown: %ds, probes: %d, probe timeout: %ds, order gateway failure threshold: %d\n",
 		response.Routing.HealthWindowSeconds,
 		response.Routing.SuccessRateThreshold,
 		response.Routing.MinCallbackCount,
 		response.Routing.UnhealthyCooldownSeconds,
 		response.Routing.HalfOpenProbeCount,
 		response.Routing.HalfOpenProbeTimeoutSeconds,
+		response.Routing.OrderGatewayFailureThreshold,
 	)
 	for _, gateway := range response.Gateways {
 		fmt.Printf("%-12s enabled=%t weight=%d state=%s in_flight=%d total=%d success=%d failure=%d success_rate=%.4f\n",
