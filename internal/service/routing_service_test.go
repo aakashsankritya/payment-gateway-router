@@ -54,11 +54,13 @@ func newTestServicesWithRegistry(cfg domain.AppConfig, clock *mutableClock, regi
 	provider := staticConfigProvider{cfg: cfg.WithDefaults()}
 	healthRepo := memory.NewGatewayHealthRepository()
 	health := NewHealthService(healthRepo, provider, clock, logger)
+	orderGateways := NewOrderGatewayBlacklistService(memory.NewOrderGatewayBlacklistRepository(), provider, clock, logger)
 	router := NewRoutingService(provider, health, clock, logger)
 	transactions := NewTransactionService(
 		memory.NewTransactionRepository(),
 		router,
 		health,
+		orderGateways,
 		registry,
 		&sequenceIDGenerator{},
 		clock,
@@ -423,14 +425,56 @@ func TestNonProbeCallbackDoesNotCompleteHalfOpenProbe(t *testing.T) {
 	}
 }
 
+func TestOrderGatewayBlacklistedAfterRepeatedFailures(t *testing.T) {
+	ctx := context.Background()
+	clock := &mutableClock{now: time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)}
+	cfg := singleGatewayConfig(100, 1, 0.90, 60)
+	cfg.Routing.OrderGatewayFailureThreshold = 2
+	transactions, _ := newTestServices(cfg, clock)
+
+	for i := 0; i < 2; i++ {
+		transaction, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD123", Amount: 499})
+		if err != nil {
+			t.Fatalf("initiate %d failed: %v", i+1, err)
+		}
+		result, err := transactions.Callback(ctx, CallbackInput{
+			TransactionID: transaction.ID,
+			OrderID:       transaction.OrderID,
+			Gateway:       transaction.Gateway,
+			Status:        domain.TransactionStatusFailure,
+			Reason:        "declined",
+		})
+		if err != nil {
+			t.Fatalf("callback %d failed: %v", i+1, err)
+		}
+		if result.OrderGatewayAttempts == nil {
+			t.Fatal("expected order gateway attempt summary")
+		}
+	}
+
+	_, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD123", Amount: 499})
+	if !errors.Is(err, domain.ErrNoAvailableGateway) {
+		t.Fatalf("same order initiate error = %v, want no available gateway", err)
+	}
+
+	nextOrder, err := transactions.Initiate(ctx, InitiateTransactionInput{OrderID: "ORD124", Amount: 499})
+	if err != nil {
+		t.Fatalf("different order should still route through gateway: %v", err)
+	}
+	if nextOrder.Gateway != "razorpay" {
+		t.Fatalf("different order gateway = %s, want razorpay", nextOrder.Gateway)
+	}
+}
+
 func singleGatewayConfig(minCallbacks int, probeCount int, threshold float64, cooldownSeconds int) domain.AppConfig {
 	return domain.AppConfig{
 		Routing: domain.RoutingConfig{
-			HealthWindowSeconds:      900,
-			UnhealthyCooldownSeconds: cooldownSeconds,
-			MinCallbackCount:         minCallbacks,
-			SuccessRateThreshold:     threshold,
-			HalfOpenProbeCount:       probeCount,
+			HealthWindowSeconds:          900,
+			UnhealthyCooldownSeconds:     cooldownSeconds,
+			MinCallbackCount:             minCallbacks,
+			SuccessRateThreshold:         threshold,
+			HalfOpenProbeCount:           probeCount,
+			OrderGatewayFailureThreshold: 2,
 		},
 		Gateways: []domain.GatewayConfig{
 			{Name: "razorpay", Enabled: true, Weight: 100},

@@ -40,6 +40,7 @@ func main() {
 
 	var transactionRepo ports.TransactionRepository = memory.NewTransactionRepository()
 	var healthRepo ports.GatewayHealthRepository = memory.NewGatewayHealthRepository()
+	var orderGatewayRepo ports.OrderGatewayBlacklistRepository = memory.NewOrderGatewayBlacklistRepository()
 	var redisStore *redisrepo.Store
 	if runtimeConfig.StateBackend == "redis" {
 		redisStore = redisrepo.NewStore(redisrepo.Options{
@@ -56,28 +57,32 @@ func main() {
 		defer redisStore.Close()
 		transactionRepo = redisrepo.NewTransactionRepository(redisStore)
 		healthRepo = redisrepo.NewGatewayHealthRepository(redisStore)
+		orderGatewayRepo = redisrepo.NewOrderGatewayBlacklistRepository(redisStore)
 		logger.Info("using redis state backend", "addr", runtimeConfig.Redis.Addr)
 	} else {
 		logger.Info("using in-memory state backend")
 	}
 	clock := service.SystemClock{}
 	idGenerator := service.RandomIDGenerator{}
+	gatewayRegistry := mock.NewRegistry()
 
 	healthService := service.NewHealthService(healthRepo, configProvider, clock, logger)
 	healthService.SetCacheTTL(runtimeConfig.GatewayStateCacheTTL())
+	orderGatewayService := service.NewOrderGatewayBlacklistService(orderGatewayRepo, configProvider, clock, logger)
 	routingService := service.NewRoutingService(configProvider, healthService, clock, logger)
 	routingService.SetCacheTTL(runtimeConfig.RoutingCacheTTL())
 	transactionService := service.NewTransactionService(
 		transactionRepo,
 		routingService,
 		healthService,
-		mock.Registry{},
+		orderGatewayService,
+		gatewayRegistry,
 		idGenerator,
 		clock,
 		logger,
 	)
 
-	router := httpadapter.NewRouter(transactionService, healthService, configProvider, logger)
+	router := httpadapter.NewRouter(transactionService, healthService, configProvider, gatewayRegistry, logger)
 	server := &http.Server{
 		Addr:              runtimeConfig.Addr,
 		Handler:           router,

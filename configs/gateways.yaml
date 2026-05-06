@@ -5,6 +5,7 @@ routing:
   success_rate_threshold: 0.90
   half_open_probe_count: 1
   half_open_probe_timeout_seconds: 60
+  order_gateway_failure_threshold: 2
 
 gateways:
   - name: razorpay

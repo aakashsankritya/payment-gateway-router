@@ -11,12 +11,13 @@ type AppConfig struct {
 }
 
 type RoutingConfig struct {
-	HealthWindowSeconds         int     `json:"health_window_seconds" yaml:"health_window_seconds"`
-	UnhealthyCooldownSeconds    int     `json:"unhealthy_cooldown_seconds" yaml:"unhealthy_cooldown_seconds"`
-	MinCallbackCount            int     `json:"min_callback_count" yaml:"min_callback_count"`
-	SuccessRateThreshold        float64 `json:"success_rate_threshold" yaml:"success_rate_threshold"`
-	HalfOpenProbeCount          int     `json:"half_open_probe_count" yaml:"half_open_probe_count"`
-	HalfOpenProbeTimeoutSeconds int     `json:"half_open_probe_timeout_seconds" yaml:"half_open_probe_timeout_seconds"`
+	HealthWindowSeconds          int     `json:"health_window_seconds" yaml:"health_window_seconds"`
+	UnhealthyCooldownSeconds     int     `json:"unhealthy_cooldown_seconds" yaml:"unhealthy_cooldown_seconds"`
+	MinCallbackCount             int     `json:"min_callback_count" yaml:"min_callback_count"`
+	SuccessRateThreshold         float64 `json:"success_rate_threshold" yaml:"success_rate_threshold"`
+	HalfOpenProbeCount           int     `json:"half_open_probe_count" yaml:"half_open_probe_count"`
+	HalfOpenProbeTimeoutSeconds  int     `json:"half_open_probe_timeout_seconds" yaml:"half_open_probe_timeout_seconds"`
+	OrderGatewayFailureThreshold int     `json:"order_gateway_failure_threshold" yaml:"order_gateway_failure_threshold"`
 }
 
 type GatewayConfig struct {
@@ -27,12 +28,13 @@ type GatewayConfig struct {
 
 func DefaultRoutingConfig() RoutingConfig {
 	return RoutingConfig{
-		HealthWindowSeconds:         15 * 60,
-		UnhealthyCooldownSeconds:    30 * 60,
-		MinCallbackCount:            10,
-		SuccessRateThreshold:        0.90,
-		HalfOpenProbeCount:          1,
-		HalfOpenProbeTimeoutSeconds: 60,
+		HealthWindowSeconds:          15 * 60,
+		UnhealthyCooldownSeconds:     30 * 60,
+		MinCallbackCount:             10,
+		SuccessRateThreshold:         0.90,
+		HalfOpenProbeCount:           1,
+		HalfOpenProbeTimeoutSeconds:  60,
+		OrderGatewayFailureThreshold: 2,
 	}
 }
 
@@ -58,6 +60,9 @@ func (c AppConfig) WithDefaults() AppConfig {
 	}
 	if c.Routing.HalfOpenProbeTimeoutSeconds <= 0 {
 		c.Routing.HalfOpenProbeTimeoutSeconds = defaults.HalfOpenProbeTimeoutSeconds
+	}
+	if c.Routing.OrderGatewayFailureThreshold <= 0 {
+		c.Routing.OrderGatewayFailureThreshold = defaults.OrderGatewayFailureThreshold
 	}
 	return c
 }
@@ -90,6 +95,9 @@ func (c AppConfig) Validate() error {
 	}
 	if c.Routing.SuccessRateThreshold <= 0 || c.Routing.SuccessRateThreshold > 1 {
 		return errors.New("success_rate_threshold must be in the range (0, 1]")
+	}
+	if c.Routing.OrderGatewayFailureThreshold <= 0 {
+		return errors.New("order_gateway_failure_threshold must be greater than zero")
 	}
 	return nil
 }

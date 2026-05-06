@@ -33,6 +33,12 @@ type GatewaySelection struct {
 	HalfOpenProbe bool
 }
 
+type GatewaySelectionRequest struct {
+	TransactionID    string
+	OrderID          string
+	ExcludedGateways map[string]struct{}
+}
+
 func NewRoutingService(configProvider ports.GatewayConfigProvider, healthService *HealthService, clock Clock, logger *slog.Logger) *RoutingService {
 	return &RoutingService{
 		configProvider: configProvider,
@@ -53,35 +59,38 @@ func (s *RoutingService) SetCacheTTL(ttl time.Duration) {
 	s.cache = routingSnapshot{}
 }
 
-func (s *RoutingService) SelectGateway(ctx context.Context, transactionID string) (GatewaySelection, error) {
+func (s *RoutingService) SelectGateway(ctx context.Context, request GatewaySelectionRequest) (GatewaySelection, error) {
 	snapshot, err := s.snapshot(ctx)
 	if err != nil {
 		return GatewaySelection{}, err
 	}
 
-	if len(snapshot.probes) > 0 {
-		selected, ok := s.selectWeighted(snapshot.probes)
+	probes := s.filterExcluded(snapshot.probes, request.ExcludedGateways)
+	healthy := s.filterExcluded(snapshot.healthy, request.ExcludedGateways)
+
+	if len(probes) > 0 {
+		selected, ok := s.selectWeighted(probes)
 		if !ok {
 			return GatewaySelection{}, domain.ErrNoAvailableGateway
 		}
-		if err := s.healthService.MarkProbeSelected(ctx, selected.Name, transactionID); err != nil {
+		if err := s.healthService.MarkProbeSelected(ctx, selected.Name, request.TransactionID); err != nil {
 			s.invalidateCache()
-			if len(snapshot.healthy) == 0 {
+			if len(healthy) == 0 {
 				return GatewaySelection{}, err
 			}
 		} else {
-			s.logger.Info("selected half-open probe gateway", "gateway", selected.Name)
+			s.logger.Info("selected half-open probe gateway", "gateway", selected.Name, "order_id", request.OrderID)
 			return GatewaySelection{Gateway: selected, HalfOpenProbe: true}, nil
 		}
 	}
 
-	selected, ok := s.selectWeighted(snapshot.healthy)
+	selected, ok := s.selectWeighted(healthy)
 	if !ok {
-		s.logger.Warn("no healthy gateway available")
+		s.logger.Warn("no healthy gateway available", "order_id", request.OrderID)
 		return GatewaySelection{}, domain.ErrNoAvailableGateway
 	}
 
-	s.logger.Info("selected healthy gateway", "gateway", selected.Name)
+	s.logger.Info("selected healthy gateway", "gateway", selected.Name, "order_id", request.OrderID)
 	return GatewaySelection{Gateway: selected}, nil
 }
 
@@ -164,4 +173,18 @@ func (s *RoutingService) selectWeighted(candidates []domain.GatewayConfig) (doma
 		}
 	}
 	return candidates[len(candidates)-1], true
+}
+
+func (s *RoutingService) filterExcluded(candidates []domain.GatewayConfig, excluded map[string]struct{}) []domain.GatewayConfig {
+	if len(candidates) == 0 || len(excluded) == 0 {
+		return candidates
+	}
+	filtered := make([]domain.GatewayConfig, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, isExcluded := excluded[candidate.Name]; isExcluded {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+	return filtered
 }
