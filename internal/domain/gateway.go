@@ -42,3 +42,20 @@ type GatewayStats struct {
 type GatewayInitiation struct {
 	ReferenceID string
 }
+
+type GatewayCallback struct {
+	TransactionID string
+	OrderID       string
+	Gateway       string
+	Status        TransactionStatus
+	Reason        string
+}
+
+type OrderGatewayAttemptSummary struct {
+	OrderID     string    `json:"order_id"`
+	Gateway     string    `json:"gateway"`
+	Failures    int       `json:"failures"`
+	Successes   int       `json:"successes"`
+	Blacklisted bool      `json:"blacklisted"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}

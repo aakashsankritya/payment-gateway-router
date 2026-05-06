@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"payment-gateway-router/internal/adapters/gateway/mock"
+	gatewayadapter "payment-gateway-router/internal/adapters/gateway"
 	"payment-gateway-router/internal/adapters/repository/memory"
 	"payment-gateway-router/internal/domain"
 	"payment-gateway-router/internal/ports"
@@ -46,7 +46,7 @@ func (g *sequenceIDGenerator) NewID(prefix string) string {
 }
 
 func newTestServices(cfg domain.AppConfig, clock *mutableClock) (*TransactionService, *HealthService) {
-	return newTestServicesWithRegistry(cfg, clock, mock.Registry{})
+	return newTestServicesWithRegistry(cfg, clock, gatewayadapter.NewRegistry())
 }
 
 func newTestServicesWithRegistry(cfg domain.AppConfig, clock *mutableClock, registry ports.GatewayClientRegistry) (*TransactionService, *HealthService) {
@@ -437,7 +437,7 @@ func TestOrderGatewayBlacklistedAfterRepeatedFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("initiate %d failed: %v", i+1, err)
 		}
-		result, err := transactions.Callback(ctx, CallbackInput{
+		_, err = transactions.Callback(ctx, CallbackInput{
 			TransactionID: transaction.ID,
 			OrderID:       transaction.OrderID,
 			Gateway:       transaction.Gateway,
@@ -446,9 +446,6 @@ func TestOrderGatewayBlacklistedAfterRepeatedFailures(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("callback %d failed: %v", i+1, err)
-		}
-		if result.OrderGatewayAttempts == nil {
-			t.Fatal("expected order gateway attempt summary")
 		}
 	}
 

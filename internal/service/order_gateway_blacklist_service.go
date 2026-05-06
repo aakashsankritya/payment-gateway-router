@@ -31,7 +31,7 @@ func (s *OrderGatewayBlacklistService) BlacklistedGateways(ctx context.Context, 
 	return s.repository.BlacklistedGateways(ctx, orderID)
 }
 
-func (s *OrderGatewayBlacklistService) RecordOutcome(ctx context.Context, transaction domain.Transaction) (domain.OrderGatewayAttemptSummary, error) {
+func (s *OrderGatewayBlacklistService) RecordOutcome(ctx context.Context, transaction domain.Transaction) error {
 	cfg := s.configProvider.Current(ctx).WithDefaults()
 	summary, newlyBlacklisted, err := s.repository.RecordOutcome(
 		ctx,
@@ -42,7 +42,7 @@ func (s *OrderGatewayBlacklistService) RecordOutcome(ctx context.Context, transa
 		s.clock.Now(),
 	)
 	if err != nil {
-		return domain.OrderGatewayAttemptSummary{}, err
+		return err
 	}
 	if newlyBlacklisted {
 		s.logger.Warn(
@@ -53,5 +53,5 @@ func (s *OrderGatewayBlacklistService) RecordOutcome(ctx context.Context, transa
 			"threshold", cfg.Routing.OrderGatewayFailureThreshold,
 		)
 	}
-	return summary, nil
+	return nil
 }

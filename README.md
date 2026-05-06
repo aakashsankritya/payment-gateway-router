@@ -169,7 +169,7 @@ sequenceDiagram
 
     Main->>Health: NewHealthService(HealthRepo, Config)
     Main->>Routing: NewRoutingService(Config, Health)
-    Main->>TxnSvc: NewTransactionService(TxRepo, Routing, Health, mock.Registry)
+    Main->>TxnSvc: NewTransactionService(TxRepo, Routing, Health, gateway.Registry)
     Main->>Router: NewRouter(TxnSvc, Health, Config)
     Router-->>Main: http.Handler
 ```

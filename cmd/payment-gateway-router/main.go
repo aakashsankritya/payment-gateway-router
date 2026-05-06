@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"payment-gateway-router/internal/adapters/config"
-	"payment-gateway-router/internal/adapters/gateway/mock"
+	gatewayadapter "payment-gateway-router/internal/adapters/gateway"
 	httpadapter "payment-gateway-router/internal/adapters/http"
 	"payment-gateway-router/internal/adapters/repository/memory"
 	redisrepo "payment-gateway-router/internal/adapters/repository/redis"
@@ -64,7 +64,7 @@ func main() {
 	}
 	clock := service.SystemClock{}
 	idGenerator := service.RandomIDGenerator{}
-	gatewayRegistry := mock.NewRegistry()
+	gatewayRegistry := gatewayadapter.NewRegistry()
 
 	healthService := service.NewHealthService(healthRepo, configProvider, clock, logger)
 	healthService.SetCacheTTL(runtimeConfig.GatewayStateCacheTTL())

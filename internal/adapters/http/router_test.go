@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"payment-gateway-router/internal/adapters/gateway/mock"
+	gatewayadapter "payment-gateway-router/internal/adapters/gateway"
 	"payment-gateway-router/internal/adapters/repository/memory"
 	"payment-gateway-router/internal/domain"
 	"payment-gateway-router/internal/service"
@@ -58,7 +58,7 @@ func TestInitiateAndCallbackHTTPFlow(t *testing.T) {
 	health := service.NewHealthService(memory.NewGatewayHealthRepository(), provider, clock, logger)
 	orderGateways := service.NewOrderGatewayBlacklistService(memory.NewOrderGatewayBlacklistRepository(), provider, clock, logger)
 	routerService := service.NewRoutingService(provider, health, clock, logger)
-	gatewayRegistry := mock.NewRegistry()
+	gatewayRegistry := gatewayadapter.NewRegistry()
 	transactions := service.NewTransactionService(
 		memory.NewTransactionRepository(),
 		routerService,
@@ -127,7 +127,7 @@ func TestGatewaySpecificCallbackHTTPFlow(t *testing.T) {
 	health := service.NewHealthService(memory.NewGatewayHealthRepository(), provider, clock, logger)
 	orderGateways := service.NewOrderGatewayBlacklistService(memory.NewOrderGatewayBlacklistRepository(), provider, clock, logger)
 	routerService := service.NewRoutingService(provider, health, clock, logger)
-	gatewayRegistry := mock.NewRegistry()
+	gatewayRegistry := gatewayadapter.NewRegistry()
 	transactions := service.NewTransactionService(
 		memory.NewTransactionRepository(),
 		routerService,
@@ -163,7 +163,7 @@ func TestGatewaySpecificCallbackHTTPFlow(t *testing.T) {
 			}
 		}
 	}`)
-	callbackReq := httptest.NewRequest(http.MethodPost, "/transactions/callback/razorpay", bytes.NewReader(callbackBody))
+	callbackReq := httptest.NewRequest(http.MethodPost, "/transactions/callback", bytes.NewReader(callbackBody))
 	callbackResp := httptest.NewRecorder()
 	handler.ServeHTTP(callbackResp, callbackReq)
 	if callbackResp.Code != http.StatusOK {

@@ -47,5 +47,5 @@ type GatewayCallbackDecoder interface {
 }
 
 type GatewayCallbackDecoderRegistry interface {
-	Decoder(gateway string) (GatewayCallbackDecoder, bool)
+	Decode(ctx context.Context, payload []byte) (domain.GatewayCallback, error)
 }

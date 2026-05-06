@@ -1,8 +1,11 @@
 package httpadapter
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -16,15 +19,17 @@ type Router struct {
 	transactions   *service.TransactionService
 	health         *service.HealthService
 	configProvider ports.GatewayConfigProvider
+	callbacks      ports.GatewayCallbackDecoderRegistry
 	logger         *slog.Logger
 	mux            *http.ServeMux
 }
 
-func NewRouter(transactions *service.TransactionService, health *service.HealthService, configProvider ports.GatewayConfigProvider, logger *slog.Logger) http.Handler {
+func NewRouter(transactions *service.TransactionService, health *service.HealthService, configProvider ports.GatewayConfigProvider, callbacks ports.GatewayCallbackDecoderRegistry, logger *slog.Logger) http.Handler {
 	router := &Router{
 		transactions:   transactions,
 		health:         health,
 		configProvider: configProvider,
+		callbacks:      callbacks,
 		logger:         logger,
 		mux:            http.NewServeMux(),
 	}
@@ -133,37 +138,67 @@ func (r *Router) handleInitiate(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) handleCallback(w http.ResponseWriter, req *http.Request) {
-	var payload callbackRequest
-	if err := decodeJSON(req, &payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_callback", err.Error())
 		return
 	}
 
-	status, err := domain.ParseTransactionStatus(payload.Status)
-	if err != nil || !status.IsFinal() {
+	input, err := r.decodeCallback(req.Context(), body)
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidStatus) {
+			writeError(w, http.StatusBadRequest, "invalid_status", "status must be success or failure")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_callback", err.Error())
+		return
+	}
+
+	r.processCallback(w, req, input)
+}
+
+func (r *Router) decodeCallback(ctx context.Context, body []byte) (service.CallbackInput, error) {
+	if input, err := decodeNormalizedCallback(body); err == nil {
+		return input, nil
+	} else if errors.Is(err, domain.ErrInvalidStatus) {
+		return service.CallbackInput{}, err
+	}
+
+	if r.callbacks == nil {
+		return service.CallbackInput{}, domain.ErrInvalidCallback
+	}
+	callback, err := r.callbacks.Decode(ctx, body)
+	if err != nil {
+		return service.CallbackInput{}, err
+	}
+	return service.CallbackInput{
+		TransactionID: callback.TransactionID,
+		OrderID:       callback.OrderID,
+		Gateway:       callback.Gateway,
+		Status:        callback.Status,
+		Reason:        callback.Reason,
+	}, nil
+}
+
+func (r *Router) processCallback(w http.ResponseWriter, req *http.Request, input service.CallbackInput) {
+	input.TransactionID = strings.TrimSpace(input.TransactionID)
+	input.OrderID = strings.TrimSpace(input.OrderID)
+	input.Gateway = strings.TrimSpace(input.Gateway)
+	input.Reason = strings.TrimSpace(input.Reason)
+	if input.TransactionID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_transaction_id", "transaction_id is required")
+		return
+	}
+	if input.Gateway == "" {
+		writeError(w, http.StatusBadRequest, "invalid_gateway", "gateway is required")
+		return
+	}
+	if !input.Status.IsFinal() {
 		writeError(w, http.StatusBadRequest, "invalid_status", "status must be success or failure")
 		return
 	}
 
-	payload.TransactionID = strings.TrimSpace(payload.TransactionID)
-	payload.OrderID = strings.TrimSpace(payload.OrderID)
-	payload.Gateway = strings.TrimSpace(payload.Gateway)
-	if payload.TransactionID == "" {
-		writeError(w, http.StatusBadRequest, "invalid_transaction_id", "transaction_id is required")
-		return
-	}
-	if payload.Gateway == "" {
-		writeError(w, http.StatusBadRequest, "invalid_gateway", "gateway is required")
-		return
-	}
-
-	result, err := r.transactions.Callback(req.Context(), service.CallbackInput{
-		TransactionID: payload.TransactionID,
-		OrderID:       payload.OrderID,
-		Gateway:       payload.Gateway,
-		Status:        status,
-		Reason:        payload.Reason,
-	})
+	result, err := r.transactions.Callback(req.Context(), input)
 	if err != nil {
 		r.writeServiceError(w, err)
 		return
@@ -194,6 +229,28 @@ func decodeJSON(req *http.Request, target any) error {
 	decoder := json.NewDecoder(req.Body)
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(target)
+}
+
+func decodeNormalizedCallback(body []byte) (service.CallbackInput, error) {
+	var payload callbackRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return service.CallbackInput{}, err
+	}
+
+	status, err := domain.ParseTransactionStatus(payload.Status)
+	if err != nil || !status.IsFinal() {
+		return service.CallbackInput{}, domain.ErrInvalidStatus
+	}
+
+	return service.CallbackInput{
+		TransactionID: payload.TransactionID,
+		OrderID:       payload.OrderID,
+		Gateway:       payload.Gateway,
+		Status:        status,
+		Reason:        payload.Reason,
+	}, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

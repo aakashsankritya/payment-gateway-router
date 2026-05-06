@@ -35,11 +35,10 @@ type CallbackInput struct {
 }
 
 type CallbackResult struct {
-	Transaction          domain.Transaction                 `json:"transaction"`
-	GatewayState         domain.GatewayRuntimeState         `json:"gateway_state"`
-	GatewayStats         domain.GatewayStats                `json:"gateway_stats"`
-	OrderGatewayAttempts *domain.OrderGatewayAttemptSummary `json:"order_gateway_attempts,omitempty"`
-	Idempotent           bool                               `json:"idempotent"`
+	Transaction  domain.Transaction         `json:"transaction"`
+	GatewayState domain.GatewayRuntimeState `json:"gateway_state"`
+	GatewayStats domain.GatewayStats        `json:"gateway_stats"`
+	Idempotent   bool                       `json:"idempotent"`
 }
 
 func NewTransactionService(
@@ -173,11 +172,9 @@ func (s *TransactionService) Callback(ctx context.Context, input CallbackInput) 
 	result.GatewayState = state
 	result.GatewayStats = stats
 	if s.orderGateways != nil {
-		summary, err := s.orderGateways.RecordOutcome(ctx, completed)
-		if err != nil {
+		if err := s.orderGateways.RecordOutcome(ctx, completed); err != nil {
 			return CallbackResult{}, err
 		}
-		result.OrderGatewayAttempts = &summary
 	}
 	s.logger.Info("callback processed", "transaction_id", completed.ID, "gateway", completed.Gateway, "status", completed.Status, "gateway_state", state.State)
 	return result, nil
