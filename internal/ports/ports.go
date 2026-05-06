@@ -25,6 +25,11 @@ type GatewayHealthRepository interface {
 	StatsSince(ctx context.Context, gateway string, since time.Time, until time.Time, bucketSize time.Duration) (domain.GatewayStats, error)
 }
 
+type OrderGatewayBlacklistRepository interface {
+	BlacklistedGateways(ctx context.Context, orderID string) (map[string]struct{}, error)
+	RecordOutcome(ctx context.Context, orderID string, gateway string, status domain.TransactionStatus, failureThreshold int, now time.Time) (domain.OrderGatewayAttemptSummary, bool, error)
+}
+
 type GatewayConfigProvider interface {
 	Current(ctx context.Context) domain.AppConfig
 }
@@ -35,4 +40,12 @@ type PaymentGatewayClient interface {
 
 type GatewayClientRegistry interface {
 	Client(gateway string) (PaymentGatewayClient, bool)
+}
+
+type GatewayCallbackDecoder interface {
+	Decode(ctx context.Context, payload []byte) (domain.GatewayCallback, error)
+}
+
+type GatewayCallbackDecoderRegistry interface {
+	Decode(ctx context.Context, payload []byte) (domain.GatewayCallback, error)
 }

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"payment-gateway-router/internal/adapters/gateway/mock"
+	gatewayadapter "payment-gateway-router/internal/adapters/gateway"
 	"payment-gateway-router/internal/adapters/repository/memory"
 	"payment-gateway-router/internal/domain"
 	"payment-gateway-router/internal/service"
@@ -56,17 +56,20 @@ func TestInitiateAndCallbackHTTPFlow(t *testing.T) {
 	provider := testConfigProvider{cfg: cfg}
 	clock := testClock{now: time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)}
 	health := service.NewHealthService(memory.NewGatewayHealthRepository(), provider, clock, logger)
+	orderGateways := service.NewOrderGatewayBlacklistService(memory.NewOrderGatewayBlacklistRepository(), provider, clock, logger)
 	routerService := service.NewRoutingService(provider, health, clock, logger)
+	gatewayRegistry := gatewayadapter.NewRegistry()
 	transactions := service.NewTransactionService(
 		memory.NewTransactionRepository(),
 		routerService,
 		health,
-		mock.Registry{},
+		orderGateways,
+		gatewayRegistry,
 		testIDGenerator{},
 		clock,
 		logger,
 	)
-	handler := NewRouter(transactions, health, provider, logger)
+	handler := NewRouter(transactions, health, provider, gatewayRegistry, logger)
 
 	initiateBody := []byte(`{"order_id":"ORD123","amount":499,"payment_instrument":{"type":"card"}}`)
 	initiateReq := httptest.NewRequest(http.MethodPost, "/transactions/initiate", bytes.NewReader(initiateBody))
@@ -101,5 +104,80 @@ func TestInitiateAndCallbackHTTPFlow(t *testing.T) {
 	}
 	if result.GatewayStats.Total != 1 {
 		t.Fatalf("stats total = %d, want 1", result.GatewayStats.Total)
+	}
+}
+
+func TestGatewaySpecificCallbackHTTPFlow(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := domain.AppConfig{
+		Routing: domain.RoutingConfig{
+			HealthWindowSeconds:          900,
+			UnhealthyCooldownSeconds:     1800,
+			MinCallbackCount:             10,
+			SuccessRateThreshold:         0.90,
+			HalfOpenProbeCount:           1,
+			OrderGatewayFailureThreshold: 2,
+		},
+		Gateways: []domain.GatewayConfig{
+			{Name: "razorpay", Enabled: true, Weight: 100},
+		},
+	}.WithDefaults()
+	provider := testConfigProvider{cfg: cfg}
+	clock := testClock{now: time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)}
+	health := service.NewHealthService(memory.NewGatewayHealthRepository(), provider, clock, logger)
+	orderGateways := service.NewOrderGatewayBlacklistService(memory.NewOrderGatewayBlacklistRepository(), provider, clock, logger)
+	routerService := service.NewRoutingService(provider, health, clock, logger)
+	gatewayRegistry := gatewayadapter.NewRegistry()
+	transactions := service.NewTransactionService(
+		memory.NewTransactionRepository(),
+		routerService,
+		health,
+		orderGateways,
+		gatewayRegistry,
+		testIDGenerator{},
+		clock,
+		logger,
+	)
+	handler := NewRouter(transactions, health, provider, gatewayRegistry, logger)
+
+	initiateBody := []byte(`{"order_id":"ORD-RZP","amount":499,"payment_instrument":{"type":"card"}}`)
+	initiateReq := httptest.NewRequest(http.MethodPost, "/transactions/initiate", bytes.NewReader(initiateBody))
+	initiateResp := httptest.NewRecorder()
+	handler.ServeHTTP(initiateResp, initiateReq)
+	if initiateResp.Code != http.StatusCreated {
+		t.Fatalf("initiate status = %d, body = %s", initiateResp.Code, initiateResp.Body.String())
+	}
+
+	callbackBody := []byte(`{
+		"event":"payment.captured",
+		"payload":{
+			"payment":{
+				"entity":{
+					"status":"captured",
+					"error_description":"",
+					"notes":{
+						"transaction_id":"txn_http_test",
+						"order_id":"ORD-RZP"
+					}
+				}
+			}
+		}
+	}`)
+	callbackReq := httptest.NewRequest(http.MethodPost, "/transactions/callback", bytes.NewReader(callbackBody))
+	callbackResp := httptest.NewRecorder()
+	handler.ServeHTTP(callbackResp, callbackReq)
+	if callbackResp.Code != http.StatusOK {
+		t.Fatalf("gateway callback status = %d, body = %s", callbackResp.Code, callbackResp.Body.String())
+	}
+
+	var result service.CallbackResult
+	if err := json.NewDecoder(callbackResp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode gateway callback response: %v", err)
+	}
+	if result.Transaction.Status != domain.TransactionStatusSuccess {
+		t.Fatalf("callback status = %s, want success", result.Transaction.Status)
+	}
+	if result.Transaction.GatewayReferenceID != "rzp_txn_http_test" {
+		t.Fatalf("gateway reference = %s, want razorpay-specific reference", result.Transaction.GatewayReferenceID)
 	}
 }

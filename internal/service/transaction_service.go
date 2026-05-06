@@ -10,13 +10,14 @@ import (
 )
 
 type TransactionService struct {
-	transactions ports.TransactionRepository
-	router       *RoutingService
-	health       *HealthService
-	gateways     ports.GatewayClientRegistry
-	idGenerator  IDGenerator
-	clock        Clock
-	logger       *slog.Logger
+	transactions  ports.TransactionRepository
+	router        *RoutingService
+	health        *HealthService
+	orderGateways *OrderGatewayBlacklistService
+	gateways      ports.GatewayClientRegistry
+	idGenerator   IDGenerator
+	clock         Clock
+	logger        *slog.Logger
 }
 
 type InitiateTransactionInput struct {
@@ -44,25 +45,35 @@ func NewTransactionService(
 	transactions ports.TransactionRepository,
 	router *RoutingService,
 	health *HealthService,
+	orderGateways *OrderGatewayBlacklistService,
 	gateways ports.GatewayClientRegistry,
 	idGenerator IDGenerator,
 	clock Clock,
 	logger *slog.Logger,
 ) *TransactionService {
 	return &TransactionService{
-		transactions: transactions,
-		router:       router,
-		health:       health,
-		gateways:     gateways,
-		idGenerator:  idGenerator,
-		clock:        clock,
-		logger:       logger,
+		transactions:  transactions,
+		router:        router,
+		health:        health,
+		orderGateways: orderGateways,
+		gateways:      gateways,
+		idGenerator:   idGenerator,
+		clock:         clock,
+		logger:        logger,
 	}
 }
 
 func (s *TransactionService) Initiate(ctx context.Context, input InitiateTransactionInput) (domain.Transaction, error) {
 	transactionID := s.idGenerator.NewID("txn")
-	selection, err := s.router.SelectGateway(ctx, transactionID)
+	excludedGateways, err := s.blacklistedGateways(ctx, input.OrderID)
+	if err != nil {
+		return domain.Transaction{}, err
+	}
+	selection, err := s.router.SelectGateway(ctx, GatewaySelectionRequest{
+		TransactionID:    transactionID,
+		OrderID:          input.OrderID,
+		ExcludedGateways: excludedGateways,
+	})
 	if err != nil {
 		return domain.Transaction{}, err
 	}
@@ -160,6 +171,18 @@ func (s *TransactionService) Callback(ctx context.Context, input CallbackInput) 
 	}
 	result.GatewayState = state
 	result.GatewayStats = stats
+	if s.orderGateways != nil {
+		if err := s.orderGateways.RecordOutcome(ctx, completed); err != nil {
+			return CallbackResult{}, err
+		}
+	}
 	s.logger.Info("callback processed", "transaction_id", completed.ID, "gateway", completed.Gateway, "status", completed.Status, "gateway_state", state.State)
 	return result, nil
+}
+
+func (s *TransactionService) blacklistedGateways(ctx context.Context, orderID string) (map[string]struct{}, error) {
+	if s.orderGateways == nil {
+		return map[string]struct{}{}, nil
+	}
+	return s.orderGateways.BlacklistedGateways(ctx, orderID)
 }
