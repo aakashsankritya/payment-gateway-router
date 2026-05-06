@@ -2,7 +2,7 @@ COMPOSE ?= docker compose
 APP_SERVICE ?= gateway
 SIMULATOR_SERVICE ?= simulator
 
-.PHONY: help deps fmt test verify build up down restart rebuild logs ps simulator redis-cli clean
+.PHONY: help deps fmt test verify build up down restart rebuild logs ps simulator simulator-order-blacklist redis-cli clean
 
 help:
 	@printf "Payment Gateway Router\n\n"
@@ -21,6 +21,7 @@ help:
 	@printf "  logs        Follow app logs\n"
 	@printf "  ps          Show compose service status\n"
 	@printf "  simulator   Run the traffic simulator\n"
+	@printf "  simulator-order-blacklist Run deterministic order blacklist scenario\n"
 	@printf "  redis-cli   Open redis-cli inside the Redis container\n"
 	@printf "  clean       Stop services and remove volumes\n"
 
@@ -58,6 +59,9 @@ ps:
 
 simulator:
 	$(COMPOSE) --profile tools run --rm $(SIMULATOR_SERVICE)
+
+simulator-order-blacklist:
+	$(COMPOSE) --profile tools run --rm $(SIMULATOR_SERVICE) go run ./cmd/simulator -base-url http://$(APP_SERVICE):8080 -scenario order-blacklist
 
 redis-cli:
 	$(COMPOSE) exec redis redis-cli
