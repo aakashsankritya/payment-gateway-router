@@ -65,6 +65,10 @@ func main() {
 	clock := service.SystemClock{}
 	idGenerator := service.RandomIDGenerator{}
 	gatewayRegistry := gatewayadapter.NewRegistry()
+	if err := gatewayRegistry.ValidateConfig(configProvider.Current(ctx)); err != nil {
+		logger.Error("gateway config is incompatible with registered clients", "error", err)
+		os.Exit(1)
+	}
 
 	healthService := service.NewHealthService(healthRepo, configProvider, clock, logger)
 	healthService.SetCacheTTL(runtimeConfig.GatewayStateCacheTTL())

@@ -10,10 +10,13 @@ routing:
 gateways:
   - name: razorpay
     enabled: true
-    weight: 50
+    weight: 40
   - name: payu
     enabled: true
-    weight: 30
+    weight: 25
   - name: cashfree
     enabled: true
     weight: 20
+  - name: juspay
+    enabled: true
+    weight: 15
