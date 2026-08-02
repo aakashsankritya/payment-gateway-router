@@ -181,3 +181,78 @@ func TestGatewaySpecificCallbackHTTPFlow(t *testing.T) {
 		t.Fatalf("gateway reference = %s, want razorpay-specific reference", result.Transaction.GatewayReferenceID)
 	}
 }
+
+func TestJuspayGatewaySpecificCallbackHTTPFlow(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := domain.AppConfig{
+		Routing: domain.RoutingConfig{
+			HealthWindowSeconds:          900,
+			UnhealthyCooldownSeconds:     1800,
+			MinCallbackCount:             10,
+			SuccessRateThreshold:         0.90,
+			HalfOpenProbeCount:           1,
+			OrderGatewayFailureThreshold: 2,
+		},
+		Gateways: []domain.GatewayConfig{
+			{Name: "juspay", Enabled: true, Weight: 100},
+		},
+	}.WithDefaults()
+	provider := testConfigProvider{cfg: cfg}
+	clock := testClock{now: time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)}
+	health := service.NewHealthService(memory.NewGatewayHealthRepository(), provider, clock, logger)
+	orderGateways := service.NewOrderGatewayBlacklistService(memory.NewOrderGatewayBlacklistRepository(), provider, clock, logger)
+	routerService := service.NewRoutingService(provider, health, clock, logger)
+	gatewayRegistry := gatewayadapter.NewRegistry()
+	transactions := service.NewTransactionService(
+		memory.NewTransactionRepository(),
+		routerService,
+		health,
+		orderGateways,
+		gatewayRegistry,
+		testIDGenerator{},
+		clock,
+		logger,
+	)
+	handler := NewRouter(transactions, health, provider, gatewayRegistry, logger)
+
+	initiateBody := []byte(`{"order_id":"ORD-JP","amount":499,"payment_instrument":{"type":"card"}}`)
+	initiateReq := httptest.NewRequest(http.MethodPost, "/transactions/initiate", bytes.NewReader(initiateBody))
+	initiateResp := httptest.NewRecorder()
+	handler.ServeHTTP(initiateResp, initiateReq)
+	if initiateResp.Code != http.StatusCreated {
+		t.Fatalf("initiate status = %d, body = %s", initiateResp.Code, initiateResp.Body.String())
+	}
+
+	callbackBody := []byte(`{
+		"event_name":"ORDER_SUCCEEDED",
+		"content":{
+			"order":{
+				"order_id":"ORD-JP",
+				"status":"CHARGED",
+				"udf1":"txn_http_test",
+				"bank_error_message":"",
+				"txn_detail":{"error_message":""}
+			}
+		}
+	}`)
+	callbackReq := httptest.NewRequest(http.MethodPost, "/transactions/callback", bytes.NewReader(callbackBody))
+	callbackResp := httptest.NewRecorder()
+	handler.ServeHTTP(callbackResp, callbackReq)
+	if callbackResp.Code != http.StatusOK {
+		t.Fatalf("juspay callback status = %d, body = %s", callbackResp.Code, callbackResp.Body.String())
+	}
+
+	var result service.CallbackResult
+	if err := json.NewDecoder(callbackResp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode juspay callback response: %v", err)
+	}
+	if result.Transaction.Status != domain.TransactionStatusSuccess {
+		t.Fatalf("callback status = %s, want success", result.Transaction.Status)
+	}
+	if result.Transaction.GatewayReferenceID != "jp_txn_http_test" {
+		t.Fatalf("gateway reference = %s, want juspay-specific reference", result.Transaction.GatewayReferenceID)
+	}
+	if result.Transaction.Gateway != "juspay" {
+		t.Fatalf("gateway = %s, want juspay", result.Transaction.Gateway)
+	}
+}
